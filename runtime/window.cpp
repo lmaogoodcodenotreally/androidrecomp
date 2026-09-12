@@ -101,6 +101,16 @@ bool Window::PumpEvents() {
         break;
       case SDL_MOUSEBUTTONDOWN:
         if (e.button.button == SDL_BUTTON_LEFT) {
+          // A real press arriving mid-wheel-drag has to end that drag first.
+          // The engine tracks one finger: two presses with no release between
+          // them leave it holding something forever, and the next tap goes
+          // nowhere -- which looks exactly like input having died.
+          if (wheel_active_) {
+            wheel_active_ = false;
+            wheel_pending_ = 0;
+            pointers_.push_back({Pointer::Up, wheel_x_, wheel_y_, last_x_,
+                                 last_y_});
+          }
           last_x_ = e.button.x;
           last_y_ = e.button.y;
           down_ = true;
@@ -129,6 +139,9 @@ bool Window::PumpEvents() {
         }
         break;
       case SDL_MOUSEWHEEL: {
+        // Never while a real button is held: the engine has one finger, and
+        // the drag already in progress is the one the player is making.
+        if (down_) break;
         // Positive y is away from the user, which wants the content to move
         // the way a finger dragging downwards would move it.
         if (!wheel_active_ && wheel_pending_ == 0)
