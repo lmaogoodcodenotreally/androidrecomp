@@ -560,6 +560,7 @@ int RunWithRecovery(Arm64Ctx* c, uint64_t target) {
 // unresolved imports to tells you exactly which shim is missing.
 uint64_t g_fault_address;
 const char* g_fault_kind = "";
+bool g_fault_has_address;
 
 // And which code touched it. A guest address alone cannot say whether lifted
 // code or a shim read it: both are compiled into this executable. The host
@@ -645,10 +646,14 @@ int FaultFilter(EXCEPTION_POINTERS* ep, unsigned long* code) {
   *code = ep->ExceptionRecord->ExceptionCode;
   g_fault_address = 0;
   g_fault_kind = "";
+  // Only an access violation reports one. Assuming otherwise is how a C++
+  // throw came out as a null dereference in the log.
+  g_fault_has_address = false;
   g_fault_pc = ep->ContextRecord ? ep->ContextRecord->Rip : 0;
   CaptureHostStack(ep->ContextRecord);
   if (ep->ExceptionRecord->NumberParameters >= 2) {
     g_fault_address = ep->ExceptionRecord->ExceptionInformation[1];
+    g_fault_has_address = true;
     switch (ep->ExceptionRecord->ExceptionInformation[0]) {
       case 0: g_fault_kind = "read"; break;
       case 1: g_fault_kind = "write"; break;
@@ -661,6 +666,7 @@ int FaultFilter(EXCEPTION_POINTERS* ep, unsigned long* code) {
 #else
 uint64_t g_fault_address;
 const char* g_fault_kind = "";
+bool g_fault_has_address;
 uint64_t g_fault_pc;
 std::string HostSymbol(uint64_t) { return std::string(); }
 uint64_t g_host_frames[24];
@@ -675,6 +681,49 @@ void ReportHostStack() {
     printf("    %s\n", where.empty() ? "(unknown)" : where.c_str());
   }
 }
+
+#if defined(_WIN32)
+// Wait for the guest thread without letting the window go dead.
+//
+// The guest runs on a thread of its own and the main thread -- the one that
+// created the window -- waits here for it. A frame that takes seconds, which
+// loading does, is a frame in which nobody answers Windows, and after a few
+// seconds of that the window is declared not responding: it greys out, stops
+// redrawing, and the title looks hung at exactly the moment it is working
+// hardest. Only the thread that created a window may pump its messages, so
+// this wait is the one place it can be done.
+//
+// Just the Win32 queue. SDL's window procedure turns those messages into SDL
+// events, and the frame loop's own PumpEvents collects them next frame, so
+// nothing about input ordering changes.
+void WaitForGuestThread(HANDLE th) {
+  bool quitting = false;
+  for (;;) {
+    if (quitting) {
+      // Stop pumping once a quit is pending, or re-posting it below would
+      // wake this wait forever. Still wait for the thread: returning while
+      // the guest is mid-call means reading its result before it wrote one.
+      WaitForSingleObject(th, INFINITE);
+      return;
+    }
+    const DWORD r =
+        MsgWaitForMultipleObjects(1, &th, FALSE, INFINITE, QS_ALLINPUT);
+    if (r != WAIT_OBJECT_0 + 1) return;  // the thread ended, or the wait failed
+    MSG msg;
+    while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+      // WM_QUIT belongs to whoever owns the loop; dispatching it here would
+      // drop the close request on the floor.
+      if (msg.message == WM_QUIT) {
+        PostQuitMessage(static_cast<int>(msg.wParam));
+        quitting = true;
+        break;
+      }
+      TranslateMessage(&msg);
+      DispatchMessage(&msg);
+    }
+  }
+}
+#endif
 
 int CallGuarded(Arm64Ctx* c, uint64_t target, unsigned long* code) {
 #if defined(_WIN32)
@@ -740,12 +789,50 @@ const char* FaultName(unsigned long code) {
     case EXCEPTION_STACK_OVERFLOW: return "stack overflow";
     case EXCEPTION_ILLEGAL_INSTRUCTION: return "illegal instruction";
     case EXCEPTION_PRIV_INSTRUCTION: return "privileged instruction";
-    default: return "exception";
+    case EXCEPTION_BREAKPOINT: return "breakpoint";
+    case EXCEPTION_DATATYPE_MISALIGNMENT: return "misaligned access";
+    case EXCEPTION_IN_PAGE_ERROR: return "in-page error";
+    // A guest C++ throw that found no handler arrives as this, and it is not
+    // a memory fault at all -- it means the unwinder walked off the end of
+    // the handler chain, which for lifted code is its own kind of bug.
+    case 0xE06D7363: return "C++ exception with no handler";
+    default: break;
   }
+  // Answering "exception" and dropping the number is how a run ends with
+  // nothing to look up: a throw and a trap read identically and want
+  // completely different investigations.
+  static char unknown[48];
+  snprintf(unknown, sizeof unknown, "exception %#lx", code);
+  return unknown;
 #else
   (void)code;
   return "signal";
 #endif
+}
+
+// What the fault was and where, as one phrase.
+//
+// Assembled here because all four report sites had assembled it themselves,
+// and all four printed "on  of 0" for anything that was not an access
+// violation -- no kind, no address, and a null one invented for the reader.
+// That sent one diagnosis chasing a null dereference that had never happened.
+std::string FaultWhat(unsigned long code) {
+  std::string out = FaultName(code);
+  if (!g_fault_has_address) return out;
+  if (*g_fault_kind) {
+    out += " on ";
+    out += g_fault_kind;
+  }
+  char at[48];
+  snprintf(at, sizeof at, " of %#llx",
+           static_cast<unsigned long long>(g_fault_address));
+  out += at;
+  const std::string what = ExplainAddress(g_fault_address);
+  if (!what.empty()) {
+    out += " -- ";
+    out += what;
+  }
+  return out;
 }
 
 }  // namespace
@@ -1074,10 +1161,7 @@ int main(int argc, char** argv) {
       printf("\n%s JNI_OnLoad: %s\n", who, arc_last_trap());
       ReportFrames();
     } else {
-      const std::string what = ExplainAddress(g_fault_address);
-      printf("\n%s JNI_OnLoad: %s on %s of %#llx%s%s\n", who, FaultName(code),
-             g_fault_kind, static_cast<unsigned long long>(g_fault_address),
-             what.empty() ? "" : " -- ", what.c_str());
+      printf("\n%s JNI_OnLoad: %s\n", who, FaultWhat(code).c_str());
       ReportFrames();
       ReportRegisters(&ctx);
     }
@@ -1103,7 +1187,7 @@ int main(int argc, char** argv) {
     // guest actually touches are ever committed.
     HANDLE th = CreateThread(nullptr, 512u << 20, RunEntry, call, 0, nullptr);
     if (th) {
-      WaitForSingleObject(th, INFINITE);
+      WaitForGuestThread(th);
       CloseHandle(th);
     } else {
       call->rc = CallGuarded(&ctx, addr, &call->code);
@@ -1160,13 +1244,9 @@ int main(int argc, char** argv) {
                  static_cast<unsigned long long>(ctors[i] - ctx.image_base),
                  arc_last_trap());
       } else {
-        const std::string what = ExplainAddress(g_fault_address);
-        snprintf(buf, sizeof(buf),
-                 "  ctor %zu at %#llx: %s on %s of %#llx%s%s", i,
+        snprintf(buf, sizeof(buf), "  ctor %zu at %#llx: %s", i,
                  static_cast<unsigned long long>(ctors[i] - ctx.image_base),
-                 FaultName(code), g_fault_kind,
-                 static_cast<unsigned long long>(g_fault_address),
-                 what.empty() ? "" : " -- ", what.c_str());
+                 FaultWhat(code).c_str());
       }
       first_failures.push_back(buf);
       if (first_failures.size() == 1) {
@@ -1316,13 +1396,10 @@ int main(int argc, char** argv) {
       ReportFrames();
       ReportRegisters(&ctx);
     } else {
-      const std::string what = ExplainAddress(g_fault_address);
       const std::string where = HostSymbol(g_fault_pc);
       if (!where.empty()) printf("  faulted in %s\n", where.c_str());
       ReportHostStack();
-      printf("  %s on %s of %#llx%s%s\n", FaultName(code), g_fault_kind,
-             static_cast<unsigned long long>(g_fault_address),
-             what.empty() ? "" : " -- ", what.c_str());
+      printf("  %s\n", FaultWhat(code).c_str());
       ReportFrames();
       ReportRegisters(&ctx);
     }
@@ -1375,9 +1452,7 @@ int main(int argc, char** argv) {
             printf("\nfaulted in %s\n", where.c_str());
           ReportHostStack();
         }
-        printf("\n%s on %s of %#llx -- %s\n", FaultName(c.code), g_fault_kind,
-               static_cast<unsigned long long>(g_fault_address),
-               ExplainAddress(g_fault_address).c_str());
+        printf("\n%s\n", FaultWhat(c.code).c_str());
       ReportFrames();
       ReportRegisters(&ctx);
       // Everything the engine asked the JNI bridge for and could not be
