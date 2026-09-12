@@ -8,6 +8,15 @@ namespace arc {
 
 #if defined(ARC_HAVE_SDL2)
 
+namespace {
+// How far one wheel notch drags, and how far one frame of that drag moves.
+// The ratio is the number of frames a notch takes to play out: four, which is
+// slow enough that the engine sees a drag rather than a jump, and quick enough
+// that a list does not feel like it is being winched.
+constexpr int kWheelNotch = 120;
+constexpr int kWheelStep = 30;
+}  // namespace
+
 Window::~Window() { Close(); }
 
 bool Window::Open(const char* title, int width, int height, std::string* err,
@@ -119,8 +128,45 @@ bool Window::PumpEvents() {
           last_y_ = e.motion.y;
         }
         break;
+      case SDL_MOUSEWHEEL: {
+        // Positive y is away from the user, which wants the content to move
+        // the way a finger dragging downwards would move it.
+        if (!wheel_active_ && wheel_pending_ == 0)
+          SDL_GetMouseState(&wheel_x_, &wheel_y_);
+        wheel_pending_ += e.wheel.y * kWheelNotch;
+        break;
+      }
       default:
         break;
+    }
+  }
+
+  // One step of the synthetic drag per pump, which is one per frame. Never
+  // while a real button is held: the engine tracks a single finger, and a
+  // second one appearing mid-drag is not something a mouse can mean.
+  if (!down_) {
+    if (wheel_pending_ != 0 && !wheel_active_) {
+      wheel_active_ = true;
+      pointers_.push_back({Pointer::Down, wheel_x_, wheel_y_, wheel_x_,
+                           wheel_y_});
+      last_x_ = wheel_x_;
+      last_y_ = wheel_y_;
+    } else if (wheel_pending_ != 0) {
+      int step = wheel_pending_;
+      if (step > kWheelStep) step = kWheelStep;
+      if (step < -kWheelStep) step = -kWheelStep;
+      const int from_y = wheel_y_;
+      wheel_y_ += step;
+      wheel_pending_ -= step;
+      pointers_.push_back({Pointer::Move, wheel_x_, wheel_y_, wheel_x_,
+                           from_y});
+      last_x_ = wheel_x_;
+      last_y_ = wheel_y_;
+    } else if (wheel_active_) {
+      wheel_active_ = false;
+      pointers_.push_back({Pointer::Up, wheel_x_, wheel_y_, last_x_, last_y_});
+      last_x_ = wheel_x_;
+      last_y_ = wheel_y_;
     }
   }
   return open;

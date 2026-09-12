@@ -77,6 +77,23 @@ class Window {
   std::deque<Pointer> pointers_;
   int last_x_ = 0, last_y_ = 0;
   bool down_ = false;
+
+  // A wheel notch, turned into a drag.
+  //
+  // The engine has no scroll event, because Android does not send it one: a
+  // list longer than the screen -- a character's task list, a store category
+  // -- is moved by dragging it, and down/move/up is the only vocabulary
+  // available. So a notch is translated into that gesture, and it has to be
+  // spread across frames: the host drains this queue completely every frame,
+  // so a whole gesture pushed at once arrives as a press and a release at the
+  // same point, which the engine reads as a tap on whatever was under the
+  // cursor. Selecting a task is the opposite of scrolling past it.
+  //
+  // Pixels rather than steps, so notches arriving faster than the drag plays
+  // out lengthen it instead of being dropped.
+  int wheel_pending_ = 0;  // signed pixels still to drag
+  int wheel_x_ = 0, wheel_y_ = 0;
+  bool wheel_active_ = false;  // a synthetic finger is currently down
 };
 
 }  // namespace arc
