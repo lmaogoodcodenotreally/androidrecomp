@@ -61,6 +61,12 @@ void ShimTraceClose(void* stream);
 // Consulted before anything else when an import is bound.
 uint64_t ShimOverride(const char* name);
 
+// Stop leaking freed memory, once whatever ARC_LEAK_FREE was covering for
+// is behind us. Leaking is affordable for a boot and not for a session:
+// measured at about 875 MB a minute during play. Blocks already leaked stay
+// leaked -- only frees after this call are honoured.
+void ShimStopLeaking();
+
 // The float-taking and float-returning imports, bound as context-taking
 // natives because the integer bridge cannot pass or return an FP register.
 uint64_t ShimResolveMath(const char* name);

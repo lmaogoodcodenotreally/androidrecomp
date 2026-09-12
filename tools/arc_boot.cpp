@@ -1523,6 +1523,21 @@ int main(int argc, char** argv) {
       } else {
         ++frames;
         g_frames_done.store(frames);
+        // ARC_LEAK_UNTIL=<frame>: recycle freed memory again from here on.
+        //
+        // ARC_LEAK_FREE exists for a lifetime bug in the DLC mount walk, which
+        // is over before the first frame -- but leaking for the whole run costs
+        // about 875 MB a minute once a title is being played, and ten minutes
+        // in the machine is paging and every frame takes long enough that input
+        // looks dead. Naming a frame draws the line where the thing being
+        // covered for has finished.
+        static const char* const until_s = getenv("ARC_LEAK_UNTIL");
+        static const long until = until_s ? strtol(until_s, nullptr, 0) : 0;
+        static bool stopped = false;
+        if (until > 0 && !stopped && frames >= until) {
+          stopped = true;
+          arc::ShimStopLeaking();
+        }
         // What the guest is doing *now*, on a timer.
         //
         // A title that is running but not progressing is the hardest state to

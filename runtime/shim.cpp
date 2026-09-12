@@ -8,6 +8,7 @@
 
 #include "arm64_context.h"
 
+#include <atomic>
 #include <cerrno>
 #include <deque>
 #include <string>
@@ -246,9 +247,23 @@ struct Entry {
 // ponytail: leak-everything, because it answers the question. If a real
 // quarantine is wanted -- hold N megabytes of freed blocks aside and release
 // the oldest -- that is the upgrade, and it belongs here.
+// Leaking everything is affordable for a boot and not for a session. Measured
+// on one: about 875 MB a minute once the game is being played, 9 GB after ten
+// minutes, at which point the machine is paging and every frame takes long
+// enough that input looks dead. The lifetime bug it covers for is in the DLC
+// mount walk, which is over before the first frame -- so the leak can be
+// switched off once that is behind us, and ShimStopLeaking is how the host
+// says so. Still not a fix; just one that does not have to be paid for as long
+// as you play.
+std::atomic<int> g_leak_state{-1};  // -1 undecided, 1 leaking, 0 recycling
+
 void ArcFree(void* p) {
-  static const bool leak = getenv("ARC_LEAK_FREE") != nullptr;
-  if (leak) return;
+  int state = g_leak_state.load(std::memory_order_relaxed);
+  if (state < 0) {
+    state = getenv("ARC_LEAK_FREE") != nullptr ? 1 : 0;
+    g_leak_state.store(state, std::memory_order_relaxed);
+  }
+  if (state == 1) return;
   free(p);
 }
 
@@ -490,6 +505,14 @@ void* HostLookup(const char* name) {
 // The resolver prefers lifted code for everything, and rightly: a guest's own
 // implementation is the one the guest was built against. The exception is a
 // function whose whole job is to end the process.
+void ShimStopLeaking() {
+  // Blocks freed while leaking stay leaked: they may still be pointed at by
+  // whatever the walk left dangling, and handing them back now is the exact
+  // hazard the knob existed to avoid. Only frees from here on are honoured.
+  if (g_leak_state.exchange(0, std::memory_order_relaxed) == 1)
+    fprintf(stderr, "[shim] recycling freed memory from now on\n");
+}
+
 uint64_t ShimOverride(const char* name) {
   static const char* const how = getenv("ARC_PURE_VIRTUAL");
   if (how && strcmp(how, "skip") == 0 &&
