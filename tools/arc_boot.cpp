@@ -562,6 +562,15 @@ uint64_t g_fault_address;
 const char* g_fault_kind = "";
 bool g_fault_has_address;
 
+// The record itself, for the exceptions that are none of the usual ones.
+// Three sessions were lost to one reporting as "exception 0": no code anybody
+// documents, no parameters, no resolvable program counter. A report that
+// cannot name a fault should at least hand over what it was given.
+unsigned long g_fault_flags;
+unsigned long g_fault_params;
+uint64_t g_fault_raised_at;
+bool g_fault_had_context;
+
 // And which code touched it. A guest address alone cannot say whether lifted
 // code or a shim read it: both are compiled into this executable. The host
 // program counter can, because this build has symbols -- so a fault can answer
@@ -649,6 +658,11 @@ int FaultFilter(EXCEPTION_POINTERS* ep, unsigned long* code) {
   // Only an access violation reports one. Assuming otherwise is how a C++
   // throw came out as a null dereference in the log.
   g_fault_has_address = false;
+  g_fault_flags = ep->ExceptionRecord->ExceptionFlags;
+  g_fault_params = ep->ExceptionRecord->NumberParameters;
+  g_fault_raised_at =
+      reinterpret_cast<uint64_t>(ep->ExceptionRecord->ExceptionAddress);
+  g_fault_had_context = ep->ContextRecord != nullptr;
   g_fault_pc = ep->ContextRecord ? ep->ContextRecord->Rip : 0;
   CaptureHostStack(ep->ContextRecord);
   if (ep->ExceptionRecord->NumberParameters >= 2) {
@@ -667,6 +681,10 @@ int FaultFilter(EXCEPTION_POINTERS* ep, unsigned long* code) {
 uint64_t g_fault_address;
 const char* g_fault_kind = "";
 bool g_fault_has_address;
+unsigned long g_fault_flags;
+unsigned long g_fault_params;
+uint64_t g_fault_raised_at;
+bool g_fault_had_context;
 uint64_t g_fault_pc;
 std::string HostSymbol(uint64_t) { return std::string(); }
 uint64_t g_host_frames[24];
@@ -818,7 +836,19 @@ const char* FaultName(unsigned long code) {
 // That sent one diagnosis chasing a null dereference that had never happened.
 std::string FaultWhat(unsigned long code) {
   std::string out = FaultName(code);
-  if (!g_fault_has_address) return out;
+  if (!g_fault_has_address) {
+    // Nothing to say about where, so say what the record itself held. An
+    // exception nobody documents is still described by its own fields, and
+    // guessing from a name we made up has cost three sessions.
+    char raw[160];
+    snprintf(raw, sizeof raw,
+             " (flags %#lx, %lu parameters, raised at %#llx, %s)",
+             g_fault_flags, g_fault_params,
+             static_cast<unsigned long long>(g_fault_raised_at),
+             g_fault_had_context ? "with a context" : "with no context");
+    out += raw;
+    return out;
+  }
   if (*g_fault_kind) {
     out += " on ";
     out += g_fault_kind;
