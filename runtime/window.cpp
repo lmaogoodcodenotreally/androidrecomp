@@ -132,8 +132,23 @@ bool Window::PumpEvents() {
         // point for; a hovering cursor is not an event Android can produce,
         // and feeding one in makes a tap out of every pass over the window.
         if (down_) {
-          pointers_.push_back({Pointer::Move, e.motion.x, e.motion.y, last_x_,
-                               last_y_});
+          // Coalesced, because the host makes one guest call per queued
+          // pointer and a guest call is not cheap. A mouse reporting at
+          // hundreds of hertz produces dozens of motions per frame, and
+          // delivering each one separately is what makes dragging a building
+          // crawl -- the work is in the delivery, not in the movement.
+          //
+          // Android does not deliver them individually either: a touch queue
+          // is drained per frame. Keep the oldest origin and the newest
+          // destination, so the move the engine sees covers the same distance
+          // it actually travelled.
+          if (!pointers_.empty() && pointers_.back().kind == Pointer::Move) {
+            pointers_.back().x = e.motion.x;
+            pointers_.back().y = e.motion.y;
+          } else {
+            pointers_.push_back({Pointer::Move, e.motion.x, e.motion.y,
+                                 last_x_, last_y_});
+          }
           last_x_ = e.motion.x;
           last_y_ = e.motion.y;
         }
