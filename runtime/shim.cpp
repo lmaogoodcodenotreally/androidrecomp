@@ -322,11 +322,21 @@ void* ArcRealloc(void* p, size_t n) {
 const char* PureVirtual() {
   static std::atomic<long> answered{0};
   const long n = ++answered;
-  if (n <= 3 || n % 1000 == 0)
+  if (n <= 8 || n % 1000 == 0) {
+    // Which call site, because the answer is only right for one of them.
+    // An empty string suits the getName() walk this was written for and is a
+    // pointer-shaped lie to anything else -- and the run that ended three
+    // calls after these appeared was tearing a town down, not walking the
+    // consumable registry. Naming the caller is what tells those apart.
     fprintf(stderr,
             "[pure] a pure virtual was called on a dead object; answered with"
             " an empty string (%ld so far)\n",
             n);
+    const size_t depth = arc_frame_count();
+    for (size_t i = 0; i < depth && i < 4; ++i)
+      fprintf(stderr, "[pure]     from %#llx\n",
+              static_cast<unsigned long long>(arc_frame_at(i)));
+  }
   return "";
 }
 
