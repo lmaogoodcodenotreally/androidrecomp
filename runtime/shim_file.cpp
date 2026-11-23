@@ -329,6 +329,30 @@ static const std::string& CpuRangeText() {
   return text;
 }
 
+// The per-core files under /sys/devices/system/cpu. Only cpu0 used to exist, so
+// a title that walks the cores -- which the device tier check does, several
+// times a second -- found a file for the first core and nothing for the rest,
+// and asked again on the next pass. A host has no sysfs, so every core gets the
+// same small honest answer; what matters is that the answer is the same shape
+// Android's is, for every core the mask above admits to.
+static const char* CpuSysfsText(const char* path) {
+  constexpr char kPrefix[] = "/sys/devices/system/cpu/cpu";
+  constexpr size_t kPrefixLength = sizeof kPrefix - 1;
+  if (!path || strncmp(path, kPrefix, kPrefixLength) != 0) return nullptr;
+  const char* at = path + kPrefixLength;
+  long cpu = 0;
+  const char* digits = at;
+  while (*at >= '0' && *at <= '9') cpu = cpu * 10 + (*at++ - '0');
+  if (at == digits || cpu >= arc::HostCoreCount()) return nullptr;
+  if (strcmp(at, "/cpu_capacity") == 0) return "1024\n";
+  if (strcmp(at, "/cpufreq/cpuinfo_max_freq") == 0 ||
+      strcmp(at, "/cpufreq/scaling_cur_freq") == 0 ||
+      strcmp(at, "/cpufreq/scaling_max_freq") == 0) {
+    return "3000000\n";
+  }
+  return nullptr;
+}
+
 // host has neither, so these opens return null and the engine's CPU and memory
 // probes read "no file" as "no information". Give them small, honest answers:
 // the register file and FP/SIMD are what the lifted code itself relies on, and
@@ -376,14 +400,7 @@ const char* VirtualFileText(const char* path) {
       strcmp(path, "/sys/devices/system/cpu/online") == 0) {
     return CpuRangeText().c_str();
   }
-  if (strcmp(path, "/sys/devices/system/cpu/cpu0/cpu_capacity") == 0) {
-    return "1024\n";
-  }
-  if (strcmp(path, "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq") == 0 ||
-      strcmp(path, "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq") == 0 ||
-      strcmp(path, "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq") == 0) {
-    return "3000000\n";
-  }
+  if (const char* text = CpuSysfsText(path)) return text;
   return nullptr;
 }
 
