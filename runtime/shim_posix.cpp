@@ -154,7 +154,10 @@ static void SleepWithSignals(std::chrono::nanoseconds total,
     if (arc_signal_pending_current()) arc_run_pending_signals();
     const auto now = std::chrono::steady_clock::now();
     if (now >= end) break;
-    auto slice = now + std::chrono::milliseconds(5);
+    // The loop exists to deliver a cooperative guest signal partway through a
+    // sleep; the slice is the worst-case delay for that, not the sleep's
+    // accuracy, because each slice is capped at the real end.
+    auto slice = now + std::chrono::milliseconds(20);
     if (slice > end) slice = end;
     std::this_thread::sleep_until(slice);
   }

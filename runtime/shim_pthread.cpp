@@ -332,6 +332,13 @@ int CondBroadcast(uint32_t* c) {
 // recognisable by its second word being the one-time "armed" flag. This is
 // deliberately gated by ARC_FAKE_VSYNC so a real Java or platform vsync source
 // can take over without changing the default.
+static uint64_t MonotonicNanosNow() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
 bool FakeVsync(uint32_t* c) {
   static const bool enabled = getenv("ARC_FAKE_VSYNC") != nullptr;
   if (!enabled) return false;
@@ -376,14 +383,25 @@ bool FakeVsync(uint32_t* c) {
   // half of that word untouched. Comparing the whole 64-bit word made this
   // depend on the allocator's leftover bytes, so ask only what the code wrote.
   if (frame[0] != 0 || (frame[1] & 0xffffffffu) != 1) return false;
-  frame[0] = 1;  // a non-zero frame stamp is all the wait loop tests
+  // The stamp is a frame *time*, not a flag: the engine measures the frame from
+  // it, so a constant leaves every delta at zero and time stops advancing while
+  // the render loop keeps drawing. A real monotonic timestamp -- the same kind
+  // of value Android's Choreographer hands over -- restores the frame step.
+  const uint64_t stamp = MonotonicNanosNow();
+  frame[0] = stamp;
   memcpy(reinterpret_cast<void*>(record), frame, sizeof frame);
   if (auto* p = g_conds.Obtain(c)) p->notify_all();
   static bool said = false;
   if (!said) {
     said = true;
-    fprintf(stderr, "[vsync] synthesised frame for UnityChoreographer at %p\n",
-            reinterpret_cast<void*>(owner));
+    Arm64Ctx* ctx = arc_current_guest_context();
+    fprintf(stderr,
+            "[vsync] synthesised frame for UnityChoreographer at %p "
+            "stamp=%llu lr=%#llx sp=%#llx\n",
+            reinterpret_cast<void*>(owner),
+            static_cast<unsigned long long>(stamp),
+            ctx ? static_cast<unsigned long long>(ctx->x[30]) : 0ull,
+            ctx ? static_cast<unsigned long long>(ctx->sp) : 0ull);
   }
   return true;
 }
@@ -416,6 +434,18 @@ bool FakeUnityClock(uint32_t* c, uint32_t* m) {
                        PAGE_EXECUTE_WRITECOPY)))
     return false;
   const uint64_t target = ctx->x[19];
+  // The engine's frame clock is an absolute time in seconds, and a frame step
+  // is the difference between two frames. It is advanced by the Android vsync
+  // callback, which this host does not have, so every step is zero and the
+  // engine's own clock stops while the renderer keeps drawing: animations,
+  // loading progress and UI fades all crawl at the minimum step the engine will
+  // accept. Adding the elapsed host time here is what the callback does.
+  static uint64_t last_clock_ns = 0;
+  const uint64_t clock_ns = MonotonicNanosNow();
+  if (last_clock_ns && clock_ns > last_clock_ns)
+    *reinterpret_cast<double*>(unity + UINT64_C(0x1886740)) +=
+        static_cast<double>(clock_ns - last_clock_ns) * 1e-9;
+  last_clock_ns = clock_ns;
   // The engine computes this target as `last + ticks_per_frame`. A saturated
   // tick count makes the clock jump by 0x7fffffff and leaves deltaTime
   // meaningless, so the value is advanced to the target as before.

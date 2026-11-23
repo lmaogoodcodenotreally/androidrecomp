@@ -422,6 +422,18 @@ const char* MethodSignature(uint64_t id) {
   return e && !e->signature.empty() ? e->signature.c_str() : nullptr;
 }
 
+// The return type of a JNI method id, read from its signature: the character
+// after `(args)`. Where an answer belongs depends on it -- a float leaves in v0
+// and everything else in x0 -- and the signature is the only place the engine
+// recorded that. Slot numbers are an accident of the order names happened to be
+// resolved in, so they cannot carry it.
+char MethodReturnType(uint64_t id) {
+  const char* signature = MethodSignature(id);
+  if (!signature) return 0;
+  const char* close = strrchr(signature, ')');
+  return close && close[1] ? close[1] : 0;
+}
+
 void NoteUnanswered(const char* name) {
   if (!name) return;
   std::lock_guard<std::mutex> held(g_method_lock);
@@ -1623,24 +1635,43 @@ struct SlotScope {
 //
 // The body Unity registers as `nativeInjectEvent` reads the event entirely
 // through JNI, so every one of these questions is on the path between a host
-// mouse and the engine's input state. The return type is a property of the JNI
-// slot, not of the name: a float-returning call has to leave its answer in v0,
-// while everything else goes in x0.
+// mouse and the engine's input state. Where the answer belongs is a property of
+// the method's return type -- a float leaves in v0, everything else in x0 -- and
+// getting that wrong turns a tap into a point the engine cannot place.
 bool AnswerMotionEvent(Arm64Ctx* c, size_t index) {
   MotionEventState state;
   if (!c->x[2] || !MotionEventStateFor(c->x[1], &state)) return false;
   const char* name = MethodName(c->x[2]);
   if (!name) return false;
 
+  // Where the answer goes is a property of the method's return type, and the
+  // signature is the only place the engine recorded it. Slot numbers depend on
+  // the order names happened to be resolved in, so they cannot carry it; they
+  // stay only as the fallback for an id created without a signature.
+  const char ret = MethodReturnType(c->x[2]);
   const bool float_result =
-      (index >= 55 && index <= 57) || (index >= 135 && index <= 137);
+      ret ? ret == 'F'
+          : (index >= 55 && index <= 57) || (index >= 135 && index <= 137);
+  static const bool trace_touch = getenv("ARC_INPUT_TRACE") != nullptr;
   const auto number = [&](double value) {
     if (float_result)
       arc_s_w(c, 0, static_cast<float>(value));
     else
       c->x[0] = static_cast<uint64_t>(static_cast<int64_t>(value));
+    // A touch that arrives but is never acted on is either an event the engine
+    // did not recognise or a field it read as a different value. Naming the
+    // field, its answer and where the answer went tells the two apart.
+    if (trace_touch &&
+        (strcmp(name, "getAction") == 0 ||
+         strcmp(name, "getActionMasked") == 0 || strcmp(name, "getX") == 0 ||
+         strcmp(name, "getY") == 0 || strcmp(name, "getSource") == 0 ||
+         strcmp(name, "getPointerCount") == 0 ||
+         strcmp(name, "getEventTime") == 0 ||
+         strcmp(name, "getDownTime") == 0)) {
+      fprintf(stderr, "[touch] %s -> %.3f (%s)\n", name, value,
+              ret ? (ret == 'F' ? "float" : "int") : "slot-guess");
+    }
   };
-
   // One finger, always index 0. Android reports the full action word here and
   // leaves masking to getActionMasked, so both are answered from the same
   // field rather than one being derived from the other.
@@ -1975,7 +2006,21 @@ void Handle(size_t index, Arm64Ctx* c) {
       // name is what lets a Java method be answered per class -- which is the
       // only way a binary protocol like NPF's can be implemented from this
       // side at all.
-      c->x[0] = AllocateText(reinterpret_cast<const char*>(c->x[1]));
+      const char* class_name = reinterpret_cast<const char*>(c->x[1]);
+      // A Choreographer here is a name with no vsync behind it. The engine
+      // enables VSYNC timing when it finds the class and then measures every
+      // frame from callbacks that never arrive, which leaves its clock stopped
+      // while the render loop keeps drawing. Answering "not there" is the truth
+      // for a host with no Java vsync thread, and the engine's own timer then
+      // supplies the frame step.
+      static const bool refuse_choreographer =
+          getenv("ARC_NO_CHOREOGRAPHER") != nullptr;
+      if (refuse_choreographer && class_name &&
+          strncmp(class_name, "android/view/Choreographer", 26) == 0) {
+        c->x[0] = 0;
+        return;
+      }
+      c->x[0] = AllocateText(class_name);
       return;
     }
 

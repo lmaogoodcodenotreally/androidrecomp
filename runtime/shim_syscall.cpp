@@ -68,14 +68,44 @@ struct GuestTimespec {
 // are deliberately a hash rather than an exact address map. Futex explicitly
 // permits spurious wakeups, so two words landing in one bucket only costs an
 // extra re-check, and the table never has to allocate while holding a lock.
+// A wait is a node on the stack of the thread that made it, linked into the
+// bucket its word hashes to. Waking by address rather than by bucket is what
+// makes FUTEX_WAKE(uaddr, 1) mean what the caller thinks it means: a semaphore
+// hands out one permit per post, and a notify spent on an unrelated word that
+// happens to share the bucket leaves the real waiter parked until the next
+// post -- often a whole frame later.
+struct FutexWaitNode;
+
 struct FutexBucket {
   std::mutex lock;
-  std::condition_variable wake;
-  std::atomic<int> waiters{0};
+  FutexWaitNode* waiters = nullptr;
+  std::atomic<int> wait_count{0};
+  // Diagnostics for ARC_FUTEX_TRACE: the last guest caller that woke this
+  // word. A wait that outlives a frame is either a timeout or a late wake, and
+  // only the waker's address says which of the two sides was late.
+  std::atomic<uint64_t> last_waker_lr{0};
+  std::atomic<uint64_t> last_waker_sp{0};
 };
+
+struct FutexWaitNode {
+  uint64_t address = 0;
+  std::condition_variable cv;
+  bool woken = false;
+  FutexWaitNode* next = nullptr;
+};
+
+// The waker is recorded on the bucket, so the waiter has to carry the answer
+// back to its own trace line.
+thread_local uint64_t t_woken_by_lr = 0;
+thread_local uint64_t t_woken_by_sp = 0;
 
 constexpr size_t kFutexBuckets = 256;
 FutexBucket g_futex[kFutexBuckets];
+
+// How long a blocked wait stays asleep before looking for a guest signal. A
+// wake always returns at once; only cooperative signal delivery waits for the
+// slice to end, and nothing in this build relies on sub-frame signal latency.
+constexpr int kWaitSliceMs = 20;
 
 FutexBucket& FutexBucketFor(uint64_t address) {
   const uint64_t mixed = (address >> 2) ^ (address >> 11) ^ (address >> 21);
@@ -137,6 +167,8 @@ int64_t FutexWait(uint64_t address, uint32_t expected, int64_t timeout_ns) {
   if (*word != expected) return -11;  // EAGAIN
 
   FutexBucket& bucket = FutexBucketFor(address);
+  FutexWaitNode node;
+  node.address = address;
   std::unique_lock<std::mutex> held(bucket.lock);
   // The guest's compare and the enqueue have to be one step from the waker's
   // point of view. It takes the same bucket lock in FutexWake, so checking
@@ -148,9 +180,15 @@ int64_t FutexWait(uint64_t address, uint32_t expected, int64_t timeout_ns) {
       timeout_ns < 0
           ? std::chrono::steady_clock::time_point::max()
           : start + std::chrono::nanoseconds(timeout_ns);
-  bucket.waiters.fetch_add(1, std::memory_order_relaxed);
+  node.next = bucket.waiters;
+  bucket.waiters = &node;
+  bucket.wait_count.fetch_add(1, std::memory_order_relaxed);
   arc_set_wait_reason("futex_wait");
+  t_woken_by_lr = 0;
+  t_woken_by_sp = 0;
+  int64_t result = 0;
   for (;;) {
+    if (node.woken) break;
     if (arc_signal_pending_current()) {
       held.unlock();
       arc_run_pending_signals();
@@ -159,32 +197,58 @@ int64_t FutexWait(uint64_t address, uint32_t expected, int64_t timeout_ns) {
     }
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
-      bucket.waiters.fetch_sub(1, std::memory_order_relaxed);
-      arc_set_wait_reason(nullptr);
-      return -110;  // ETIMEDOUT
+      result = -110;  // ETIMEDOUT
+      break;
     }
-    auto slice = now + std::chrono::milliseconds(5);
+    // The slice bounds how late a cooperative guest signal can be delivered to
+    // a blocked thread; it is not part of the wait. A short slice costs a wake
+    // per slice per blocked thread, and with a dozen parked workers that is
+    // real idle CPU, so keep it as long as the signal latency allows.
+    auto slice = now + std::chrono::milliseconds(kWaitSliceMs);
     if (slice > deadline) slice = deadline;
-    if (bucket.wake.wait_until(held, slice) == std::cv_status::no_timeout) {
-      bucket.waiters.fetch_sub(1, std::memory_order_relaxed);
-      arc_set_wait_reason(nullptr);
-      return 0;
+    node.cv.wait_until(held, slice);
+  }
+  // The node lives on this stack, so it has to leave the list before the wait
+  // returns. The bucket lock still excludes every waker, which is what makes
+  // the unlink safe.
+  for (FutexWaitNode** link = &bucket.waiters; *link; link = &(*link)->next) {
+    if (*link == &node) {
+      *link = node.next;
+      break;
     }
   }
+  bucket.wait_count.fetch_sub(1, std::memory_order_relaxed);
+  if (result == 0) {
+    t_woken_by_lr = bucket.last_waker_lr.load(std::memory_order_relaxed);
+    t_woken_by_sp = bucket.last_waker_sp.load(std::memory_order_relaxed);
+  }
+  held.unlock();
+  arc_set_wait_reason(nullptr);
+  return result;
 }
 
 int64_t FutexWake(uint64_t address, uint32_t count) {
   if (!count) return 0;
   if (!GuestReadable(address, sizeof(uint32_t))) return -14;
+  // Only the trace pays for naming the waker; the flag is read once.
+  static const bool trace_wakers = getenv("ARC_FUTEX_TRACE") != nullptr;
   FutexBucket& bucket = FutexBucketFor(address);
   std::lock_guard<std::mutex> held(bucket.lock);
-  const int waiting = bucket.waiters.load(std::memory_order_relaxed);
-  if (count == std::numeric_limits<uint32_t>::max()) {
-    bucket.wake.notify_all();
-  } else {
-    for (uint32_t i = 0; i < count; ++i) bucket.wake.notify_one();
+  if (trace_wakers) {
+    const Arm64Ctx* w = arc_current_guest_context();
+    bucket.last_waker_lr.store(w ? w->x[30] : 0, std::memory_order_relaxed);
+    bucket.last_waker_sp.store(w ? w->sp : 0, std::memory_order_relaxed);
   }
-  return std::min<int64_t>(waiting, count);
+  // Linux reports how many waiters were actually woken, and a wake for a word
+  // that nobody is waiting on must not spend a permit on another word.
+  uint32_t woken = 0;
+  for (FutexWaitNode* n = bucket.waiters; n && woken < count; n = n->next) {
+    if (n->address != address) continue;
+    n->woken = true;
+    n->cv.notify_one();
+    ++woken;
+  }
+  return woken;
 }
 
 void FutexRequeue(uint64_t from, uint64_t to, uint32_t wake_count,
@@ -298,12 +362,17 @@ extern "C" int64_t arc_svc(Arm64Ctx* c) {
       const auto started = trace ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
       int64_t result = 0;
+      // What the caller asked for, as opposed to what it got. A wait that lasts
+      // its full deadline and one that is woken late look identical in the
+      // duration alone.
+      int64_t requested_ns = -1;
       switch (command) {
         case kWait:
         case kWaitBitset: {
           const bool absolute = command == kWaitBitset;
           const bool realtime = (static_cast<uint32_t>(a1) & kClockRealtime) != 0;
-          result = FutexWait(a0, value, FutexTimeoutNs(a3, absolute, realtime));
+          requested_ns = FutexTimeoutNs(a3, absolute, realtime);
+          result = FutexWait(a0, value, requested_ns);
           break;
         }
         case kWake:
@@ -351,16 +420,27 @@ extern "C" int64_t arc_svc(Arm64Ctx* c) {
         // timeout, is the interesting kind: it names the guest caller and the
         // word that nobody signalled.
         if (ms >= 20.0 || result == -110) {
+          // Name the caller. A futex reached through the `syscall` import
+          // arrives with a synthesised context whose lr and sp are zero, so
+          // fall back to the thread's real guest context, which is the lifted
+          // function that asked.
+          const Arm64Ctx* caller = c;
+          if (!caller->x[30]) caller = arc_current_guest_context();
           fprintf(stderr,
                   "[futex] op=%#llx cmd=%#x addr=%#llx val=%#llx timeout=%#llx"
-                  " ret=%lld %.1fms lr=%#llx sp=%#llx\n",
+                  " ret=%lld %.1fms want=%lldms lr=%#llx sp=%#llx"
+                  " by=%#llx bysp=%#llx\n",
                   static_cast<unsigned long long>(a1), command,
                   static_cast<unsigned long long>(a0),
                   static_cast<unsigned long long>(value),
                   static_cast<unsigned long long>(a3),
                   static_cast<long long>(result), ms,
-                  static_cast<unsigned long long>(c->x[30]),
-                  static_cast<unsigned long long>(c->sp));
+                  static_cast<long long>(requested_ns < 0 ? -1
+                                                          : requested_ns / 1000000),
+                  caller ? static_cast<unsigned long long>(caller->x[30]) : 0,
+                  caller ? static_cast<unsigned long long>(caller->sp) : 0,
+                  static_cast<unsigned long long>(t_woken_by_lr),
+                  static_cast<unsigned long long>(t_woken_by_sp));
         }
       }
       return result;
