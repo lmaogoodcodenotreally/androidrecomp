@@ -2214,6 +2214,26 @@ static int ArcDispatchDiag(void) {
   return g_dispatch_diag;
 }
 
+/* Metadata names are reached through pointers this code does not own: a trace
+   that prints one as a C string can fault inside the C runtime, where the fault
+   reads as a host bug instead of a bad guest pointer. Copying what is readable
+   keeps the trace answering the question it was added for. */
+static const char* ArcSafeText(uint64_t address) {
+  static char texts[4][96];
+  static unsigned next;
+  char* text = texts[next++ & 3];
+  size_t i = 0;
+  for (; address && i + 1 < sizeof texts[0]; ++i) {
+    if (!arc_can_read(address + i, 1)) break;
+    const char c = *(const char*)(uintptr_t)(address + i);
+    if (!c) break;
+    text[i] = (c >= 0x20 && c < 0x7f) ? c : '?';
+  }
+  if (!i && !address) return "?";
+  text[i] = 0;
+  return text;
+}
+
 void arc_dispatch(Arm64Ctx* c, uint64_t target) {
   Arm64Ctx* const previous_guest = t_current_guest_context;
   c->pc = t_dispatch_pc;
@@ -2350,9 +2370,8 @@ void arc_dispatch(Arm64Ctx* c, uint64_t target) {
         const uint64_t name = arc_ld64(klass + 0x10);
         const uint64_t ns = arc_ld64(klass + 0x18);
         fprintf(stderr, "[throw] klass=%#llx name=%s ns=%s\n",
-                (unsigned long long)klass,
-                name ? (const char*)(uintptr_t)name : "?",
-                ns ? (const char*)(uintptr_t)ns : "?");
+                (unsigned long long)klass, ArcSafeText(name),
+                ArcSafeText(ns));
       }
       arc_watch_il2cpp_string("message", message);
       arc_watch_il2cpp_string("classname", class_name);
@@ -2403,10 +2422,8 @@ void arc_dispatch(Arm64Ctx* c, uint64_t target) {
         fprintf(stderr,
                 "[managed] loop method=%#llx fn=%#llx name=%s class=%s.%s\n",
                 (unsigned long long)method,
-                (unsigned long long)arc_ld64(method),
-                name ? (const char*)(uintptr_t)name : "?",
-                kns ? (const char*)(uintptr_t)kns : "?",
-                kname ? (const char*)(uintptr_t)kname : "?");
+                (unsigned long long)arc_ld64(method), ArcSafeText(name),
+                ArcSafeText(kns), ArcSafeText(kname));
       }
     } else if (target == base + UINT64_C(0x1ece0b8) && managed_shown < 400) {
       ++managed_shown;
@@ -2416,9 +2433,8 @@ void arc_dispatch(Arm64Ctx* c, uint64_t target) {
       if (klass) {
         const uint64_t name = arc_ld64(klass + 0x10);
         const uint64_t ns = arc_ld64(klass + 0x18);
-        fprintf(stderr, "[managed]   name=%s ns=%s\n",
-                name ? (const char*)(uintptr_t)name : "?",
-                ns ? (const char*)(uintptr_t)ns : "?");
+        fprintf(stderr, "[managed]   name=%s ns=%s\n", ArcSafeText(name),
+                ArcSafeText(ns));
       }
     }
   }
