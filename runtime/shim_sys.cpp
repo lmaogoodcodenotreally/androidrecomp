@@ -1935,8 +1935,22 @@ int SemGetvalue(void*, int* value) {
   return 0;
 }
 int SemTimedwait(void*, const void*) { return -1; }
+// A positional read must not disturb the descriptor's own offset, and the only
+// way to do that here is seek, read, seek back. That sequence is not atomic, so
+// two threads reading the same descriptor at once can each land on the other's
+// offset and read the wrong bytes -- which on a title that streams a multi-
+// gigabyte asset store from a shared descriptor shows up much later as a
+// corrupted record, not as a short read. Serialising per descriptor keeps the
+// sequence whole without moving every read onto its own handle.
+std::mutex g_positional_lock[64];
+
+std::mutex& PositionalLock(int fd) {
+  return g_positional_lock[static_cast<unsigned>(fd) % 64];
+}
+
 long long Pread(int fd, void* buffer, size_t count, long long offset) {
 #if defined(_WIN32)
+  std::lock_guard<std::mutex> held(PositionalLock(fd));
   const __int64 old = _lseeki64(fd, 0, SEEK_CUR);
   if (old < 0 || _lseeki64(fd, offset, SEEK_SET) < 0) return -1;
   const int n = _read(fd, buffer, static_cast<unsigned>(count));
@@ -1948,6 +1962,7 @@ long long Pread(int fd, void* buffer, size_t count, long long offset) {
 }
 long long Pwrite(int fd, const void* buffer, size_t count, long long offset) {
 #if defined(_WIN32)
+  std::lock_guard<std::mutex> held(PositionalLock(fd));
   const __int64 old = _lseeki64(fd, 0, SEEK_CUR);
   if (old < 0 || _lseeki64(fd, offset, SEEK_SET) < 0) return -1;
   const int n = _write(fd, buffer, static_cast<unsigned>(count));
