@@ -24,7 +24,10 @@
 #include <string>
 #include <vector>
 
+#include <windows.h>
+
 #include "arm64_context.h"
+#include "gfx_backend.h"
 #include <algorithm>
 #include <map>
 #include <mutex>
@@ -44,12 +47,182 @@ using GLint = int;
 using GLsizei = int;
 using GLenum = unsigned;
 using GLchar = char;
+using GLubyte = unsigned char;
 
 constexpr GLenum kCompileStatus = 0x8B81;
 constexpr GLenum kLinkStatus = 0x8B82;
 constexpr GLenum kInfoLogLength = 0x8B84;
+constexpr GLenum kExtensions = 0x1F03;
+constexpr GLenum kVersion = 0x1F02;
+constexpr GLenum kShadingLanguageVersion = 0x8B8C;
+constexpr GLenum kNumExtensions = 0x821D;
 
-void* Real(const char* name) { return SDL_GL_GetProcAddress(name); }
+void* Real(const char* name) {
+  // ANGLE owns the context in the angle-* backends; desktop GL resolves
+  // through the SDL context. Either way the engine sees GLES2 entry points.
+  if (arc::GfxAngleActive()) {
+    if (void* p = arc::GfxAngleProc(name)) return p;
+  }
+  return SDL_GL_GetProcAddress(name);
+}
+
+// Per-call glGetError round-trips are diagnostics, not correctness: on the AMD
+// driver each one can sync the pipeline. They stay off unless asked for, so a
+// draw or an upload costs one driver call instead of two.
+bool GlTraceErrors() {
+  static const bool on = getenv("ARC_GL_TRACE_ERRORS") != nullptr;
+  return on;
+}
+
+// The engine is an Android GLES2 build. Its renderer selects the GLES2
+// entry-point set from that build, but it reads capabilities from the host
+// driver's extension string -- which on a desktop compatibility context
+// advertises things GLES2 does not have. A capability can then be set for an
+// entry point the renderer never loaded, and the first use of it branches
+// through a null slot. Filtering tokens here keeps the reported surface no
+// wider than the one the engine actually implements; ARC_GL_HIDE_EXT takes a
+// comma-separated list of substrings to drop, and ARC_GL_EXTENSIONS replaces
+// the whole string when a specific profile is wanted.
+bool ExtTokenHidden(const std::string& token) {
+  const char* list = getenv("ARC_GL_HIDE_EXT");
+  if (!list || !*list) return false;
+  // A broad hide list is the safe default, but an extension the host really
+  // implements must survive it or the engine decodes every compressed texture
+  // on the CPU. Keep entries are checked first and win over the hide list.
+  const char* keep = getenv("ARC_GL_KEEP_EXT");
+  if (keep && *keep) {
+    for (const char* p = keep; *p;) {
+      const char* comma = strchr(p, ',');
+      const size_t n = comma ? static_cast<size_t>(comma - p) : strlen(p);
+      if (n && token.find(p, 0, n) != std::string::npos) return false;
+      if (!comma) break;
+      p = comma + 1;
+    }
+  }
+  for (const char* p = list; *p;) {
+    const char* comma = strchr(p, ',');
+    const size_t n = comma ? static_cast<size_t>(comma - p) : strlen(p);
+    if (n && token.find(p, 0, n) != std::string::npos) return true;
+    if (!comma) break;
+    p = comma + 1;
+  }
+  return false;
+}
+
+const GLubyte* RawString(GLenum name) {
+  auto real =
+      reinterpret_cast<const GLubyte* (*)(GLenum)>(Real("glGetString"));
+  return real ? real(name) : nullptr;
+}
+
+// One string is the source of truth for both the old GL_EXTENSIONS query and
+// the indexed GL_NUM_EXTENSIONS/glGetStringi pair. Otherwise the engine can
+// read the filtered list through one path and the desktop list through the
+// other, and believe in a capability it cannot call.
+const std::string& CuratedExtensions() {
+  static thread_local std::string filtered;
+  filtered.clear();
+  const char* whole = getenv("ARC_GL_EXTENSIONS");
+  if (whole) {
+    filtered = whole;
+    return filtered;
+  }
+  const GLubyte* answer = RawString(kExtensions);
+  if (!answer) return filtered;
+  if (getenv("ARC_GL_RAW_EXT")) {
+    static bool said;
+    if (!said) {
+      said = true;
+      fprintf(stderr, "[gl-raw] %s\n", reinterpret_cast<const char*>(answer));
+    }
+  }
+  if (!getenv("ARC_GL_HIDE_EXT")) {
+    filtered.assign(reinterpret_cast<const char*>(answer));
+    return filtered;
+  }
+  const std::string source(reinterpret_cast<const char*>(answer));
+  size_t i = 0;
+  while (i < source.size()) {
+    size_t end = source.find(' ', i);
+    if (end == std::string::npos) end = source.size();
+    const std::string token = source.substr(i, end - i);
+    if (!token.empty() && !ExtTokenHidden(token)) {
+      filtered += token;
+      filtered += ' ';
+    }
+    i = end + 1;
+  }
+  return filtered;
+}
+
+GLint ExtensionCount() {
+  const std::string& s = CuratedExtensions();
+  GLint n = 0;
+  size_t i = 0;
+  while (i < s.size()) {
+    size_t end = s.find(' ', i);
+    if (end == std::string::npos) end = s.size();
+    if (end > i) ++n;
+    i = end + 1;
+  }
+  return n;
+}
+
+const GLubyte* GlesGetString(GLenum name) {
+  const GLubyte* answer = RawString(name);
+  const char* trace = getenv("ARC_TRACE_GLSTRING");
+  if (trace)
+    fprintf(stderr, "[glstring] %#x = %s\n", name,
+            answer ? reinterpret_cast<const char*>(answer) : "(null)");
+
+  if (name == kExtensions)
+    return reinterpret_cast<const GLubyte*>(CuratedExtensions().c_str());
+  if (name == kVersion) {
+    const char* s = getenv("ARC_GL_VERSION_STRING");
+    if (s) return reinterpret_cast<const GLubyte*>(s);
+  }
+  if (name == kShadingLanguageVersion) {
+    const char* s = getenv("ARC_GL_GLSL_VERSION_STRING");
+    if (s) return reinterpret_cast<const GLubyte*>(s);
+  }
+  return answer;
+}
+
+const GLubyte* GlesGetStringi(GLenum name, GLuint index) {
+  if (name != kExtensions) {
+    auto real = reinterpret_cast<const GLubyte* (*)(GLenum, GLuint)>(
+        Real("glGetStringi"));
+    return real ? real(name, index) : nullptr;
+  }
+  const std::string& s = CuratedExtensions();
+  static thread_local std::string token;
+  token.clear();
+  GLuint n = 0;
+  size_t i = 0;
+  while (i < s.size()) {
+    size_t end = s.find(' ', i);
+    if (end == std::string::npos) end = s.size();
+    if (end > i) {
+      if (n == index) {
+        token.assign(s, i, end - i);
+        return reinterpret_cast<const GLubyte*>(token.c_str());
+      }
+      ++n;
+    }
+    i = end + 1;
+  }
+  return nullptr;
+}
+
+void GlesGetIntegerv(GLenum pname, GLint* data) {
+  if (pname == kNumExtensions) {
+    if (data) *data = ExtensionCount();
+    return;
+  }
+  auto real = reinterpret_cast<void (*)(GLenum, GLint*)>(
+      Real("glGetIntegerv"));
+  if (real) real(pname, data);
+}
 
 // GLSL ES 1.00 into GLSL 1.20, which is what a 2.1 context accepts.
 //
@@ -107,7 +280,9 @@ void ShaderSource(GLuint shader, GLsizei count, const GLchar* const* strings,
     else
       joined.append(strings[i]);
   }
-  std::string translated = ToDesktopGlsl(joined);
+  // ANGLE is a GLES2 implementation: it wants the original GLSL ES. The
+  // precision-stripping translation exists only for a desktop GL driver.
+  std::string translated = arc::GfxAngleActive() ? joined : ToDesktopGlsl(joined);
   // Two diagnostics, off unless asked for, that split the fragment stage in
   // half. ARC_GL_FLAT=1 paints every fragment solid red: an empty frame with
   // that on means the geometry never arrives, and neither the texture nor the
@@ -155,6 +330,91 @@ void LinkProgram(GLuint program) {
   if (!ok)
     fprintf(stderr, "program %u failed to link:\n%s\n", program,
             InfoLog(program, true).c_str());
+  if (getenv("ARC_TRACE_SHADERS")) {
+    auto get_attached = reinterpret_cast<void (*)(
+        GLuint, GLsizei, GLsizei*, GLuint*)>(Real("glGetAttachedShaders"));
+    auto get_active_attr = reinterpret_cast<void (*)(
+        GLuint, GLuint, GLsizei, GLsizei*, GLint*, GLenum*, GLchar*)>(
+        Real("glGetActiveAttrib"));
+    auto get_attr_loc = reinterpret_cast<GLint (*)(GLuint, const GLchar*)>(
+        Real("glGetAttribLocation"));
+    GLint count = 0;
+    if (get_iv) get_iv(program, 0x8B85 /* GL_ATTACHED_SHADERS */, &count);
+    std::vector<GLuint> ids(static_cast<size_t>(count > 0 ? count : 0));
+    GLsizei got = 0;
+    if (get_attached && count > 0)
+      get_attached(program, count, &got, ids.data());
+    fprintf(stderr, "[program %u] attached shaders", program);
+    for (GLsizei i = 0; i < got; ++i) fprintf(stderr, " %u", ids[i]);
+    fprintf(stderr, "\n");
+    auto get_shader_iv = reinterpret_cast<void (*)(GLuint, GLenum, GLint*)>(
+        Real("glGetShaderiv"));
+    auto get_shader_source = reinterpret_cast<void (*)(
+        GLuint, GLsizei, GLsizei*, GLchar*)>(Real("glGetShaderSource"));
+    if (get_shader_iv && get_shader_source) {
+      for (GLsizei i = 0; i < got; ++i) {
+        GLint len = 0;
+        get_shader_iv(ids[i], 0x8B88 /* GL_SHADER_SOURCE_LENGTH */, &len);
+        if (len <= 0) continue;
+        std::vector<GLchar> src(static_cast<size_t>(len));
+        GLsizei written = 0;
+        get_shader_source(ids[i], static_cast<GLsizei>(src.size()), &written,
+                          src.data());
+        fprintf(stderr, "[program %u] shader %u source:\n%s\n", program, ids[i],
+                src.data());
+      }
+    }
+    GLint active = 0, maxlen = 0;
+    if (get_iv) {
+      get_iv(program, 0x8B89 /* GL_ACTIVE_ATTRIBUTES */, &active);
+      get_iv(program, 0x8B8A /* GL_ACTIVE_ATTRIBUTE_MAX_LENGTH */, &maxlen);
+    }
+    std::vector<GLchar> name(static_cast<size_t>(maxlen > 0 ? maxlen : 1));
+    for (GLint i = 0; i < active && get_active_attr; ++i) {
+      GLsizei len = 0;
+      GLint size = 0;
+      GLenum type = 0;
+      get_active_attr(program, static_cast<GLuint>(i),
+                      static_cast<GLsizei>(name.size()), &len, &size, &type,
+                      name.data());
+      const GLint loc =
+          get_attr_loc ? get_attr_loc(program, name.data()) : -2;
+      fprintf(stderr, "[program %u] attr %s loc=%d size=%d type=%#x\n",
+              program, name.data(), loc, size, type);
+    }
+  }
+}
+
+// A created name of zero is not an error the engine reports: every later call
+// takes the zero and does nothing, so the shader compiles to nothing, the
+// program links to nothing, and the frame draws with a full set of calls behind
+// it. The cause is always the same -- the driver has no current context on this
+// thread -- so the id, the error and the thread are worth printing together
+// when the shader trace is on.
+GLuint CreateShader(GLenum type) {
+  auto real = reinterpret_cast<GLuint (*)(GLenum)>(Real("glCreateShader"));
+  const GLuint id = real ? real(type) : 0;
+  if (getenv("ARC_TRACE_SHADERS")) {
+    auto get_error = reinterpret_cast<GLenum (*)()>(Real("glGetError"));
+    fprintf(stderr, "[createShader] type=%#x id=%u err=%#x ctx=%p tid=%lu\n",
+            type, id, get_error ? get_error() : 0,
+            static_cast<void*>(SDL_GL_GetCurrentContext()),
+            static_cast<unsigned long>(SDL_ThreadID()));
+  }
+  return id;
+}
+
+GLuint CreateProgram() {
+  auto real = reinterpret_cast<GLuint (*)()>(Real("glCreateProgram"));
+  const GLuint id = real ? real() : 0;
+  if (getenv("ARC_TRACE_SHADERS")) {
+    auto get_error = reinterpret_cast<GLenum (*)()>(Real("glGetError"));
+    fprintf(stderr, "[createProgram] id=%u err=%#x ctx=%p tid=%lu\n", id,
+            get_error ? get_error() : 0,
+            static_cast<void*>(SDL_GL_GetCurrentContext()),
+            static_cast<unsigned long>(SDL_ThreadID()));
+  }
+  return id;
 }
 
 // A draw that the driver rejects still counts as a draw everywhere else: the
@@ -251,12 +511,22 @@ int TraceFrame() {
 int g_frame = 0;
 
 void TraceThisDraw(unsigned texture, int count) {
-  if (!TraceFrame() || g_frame != TraceFrame()) return;
+  static const bool all = getenv("ARC_GL_TRACE_ALL") != nullptr;
+  if (!all && (!TraceFrame() || g_frame != TraceFrame())) return;
+  static int n = 0;
+  if (all && n >= 400) return;
   auto is_on = reinterpret_cast<unsigned char (*)(GLenum)>(Real("glIsEnabled"));
   auto get_int = reinterpret_cast<void (*)(GLenum, GLint*)>(
       Real("glGetIntegerv"));
-  static int n = 0;
   GLint mask = -1, func = -1, src = -1, dst = -1, prog = -1;
+  GLint draw_fb = -1, read_fb = -1;
+  GLint viewport[4] = {0, 0, 0, 0};
+  GLint read_buffer = -1, draw_buffer0 = -1;
+  GLint array_buf = -1, element_buf = -1;
+  GLint cull_mode = -1, front = -1, scissor[4] = {0, 0, 0, 0};
+  GLint color_mask[4] = {0, 0, 0, 0};
+  GLint stencil_func = -1, stencil_ref = -1, stencil_value = -1,
+        stencil_mask = -1;
   if (get_int) {
     get_int(0x0B72 /* GL_DEPTH_WRITEMASK */, &mask);
     get_int(0x0B74 /* GL_DEPTH_FUNC */, &func);
@@ -267,6 +537,27 @@ void TraceThisDraw(unsigned texture, int count) {
     get_int(0x80C9 /* GL_BLEND_SRC_RGB */, &src);
     get_int(0x80C8 /* GL_BLEND_DST_RGB */, &dst);
     get_int(0x8B8D /* GL_CURRENT_PROGRAM */, &prog);
+    // A draw that is correct in every other respect still writes nothing if it
+    // is aimed at an offscreen target, so name the target in the trace.
+    get_int(0x8CA6 /* GL_DRAW_FRAMEBUFFER_BINDING */, &draw_fb);
+    get_int(0x8CAA /* GL_READ_FRAMEBUFFER_BINDING */, &read_fb);
+    get_int(0x0BA2 /* GL_VIEWPORT */, viewport);
+    // A draw aimed at one buffer and read back from another looks exactly like
+    // a draw that wrote nothing.
+    get_int(0x0C02 /* GL_READ_BUFFER */, &read_buffer);
+    get_int(0x8825 /* GL_DRAW_BUFFER0 */, &draw_buffer0);
+    get_int(0x8894 /* GL_ARRAY_BUFFER_BINDING */, &array_buf);
+    get_int(0x8895 /* GL_ELEMENT_ARRAY_BUFFER_BINDING */, &element_buf);
+    // Raster state that discards fragments before the shader or before the
+    // write, independently of where the geometry lands.
+    get_int(0x0B45 /* GL_CULL_FACE_MODE */, &cull_mode);
+    get_int(0x0B46 /* GL_FRONT_FACE */, &front);
+    get_int(0x0C10 /* GL_SCISSOR_BOX */, scissor);
+    get_int(0x0C23 /* GL_COLOR_WRITEMASK */, color_mask);
+    get_int(0x0B92 /* GL_STENCIL_FUNC */, &stencil_func);
+    get_int(0x0B97 /* GL_STENCIL_REF */, &stencil_ref);
+    get_int(0x0B93 /* GL_STENCIL_VALUE_MASK */, &stencil_value);
+    get_int(0x0B94 /* GL_STENCIL_WRITEMASK */, &stencil_mask);
   }
   fprintf(stderr, "[gl]   matrix % .3f % .3f % .3f % .3f | % .3f % .3f"
                   " % .3f % .3f\n",
@@ -274,13 +565,69 @@ void TraceThisDraw(unsigned texture, int count) {
           g_last_matrix[3], g_last_matrix[12], g_last_matrix[13],
           g_last_matrix[14], g_last_matrix[15]);
   fprintf(stderr,
-          "[gl] frame %d draw %-5d texture %-4u indices %-6d prog %-3d"
+          "[gl] frame %d draw %-5d tid=%lu texture %-4u indices %-6d prog %-3d"
+          " fbo draw=%d read=%d viewport=%d,%d %dx%d"
           " diffuse %.3f %.3f %.3f %.3f"
           " depth=%s write=%d func=%#x blend=%s src=%#x dst=%#x\n",
-          g_frame, n++, texture, count, prog, g_last_uniform4[0],
+          g_frame, n++, static_cast<unsigned long>(GetCurrentThreadId()), texture,
+          count, prog, draw_fb, read_fb, viewport[0],
+          viewport[1], viewport[2], viewport[3], g_last_uniform4[0],
           g_last_uniform4[1], g_last_uniform4[2], g_last_uniform4[3],
           is_on && is_on(0x0B71 /* GL_DEPTH_TEST */) ? "on" : "off", mask, func,
           is_on && is_on(0x0BE2 /* GL_BLEND */) ? "on" : "off", src, dst);
+  fprintf(stderr,
+          "[gl]   state cull=%s mode=%#x front=%#x scissor=%s"
+          " [%d,%d %dx%d] colormask=%d%d%d%d stencil=%s func=%#x ref=%d"
+          " vmask=%#x wmask=%#x discard=%s\n",
+          is_on && is_on(0x0B44 /* GL_CULL_FACE */) ? "on" : "off", cull_mode,
+          front, is_on && is_on(0x0C11 /* GL_SCISSOR_TEST */) ? "on" : "off",
+          scissor[0], scissor[1], scissor[2], scissor[3], color_mask[0],
+          color_mask[1], color_mask[2], color_mask[3],
+          is_on && is_on(0x0B90 /* GL_STENCIL_TEST */) ? "on" : "off",
+          stencil_func, stencil_ref, stencil_value, stencil_mask,
+          is_on && is_on(0x8C89 /* GL_RASTERIZER_DISCARD */) ? "on" : "off");
+  fprintf(stderr,
+          "[gl]   buffer read=%#x draw0=%#x array=%d element=%d\n",
+          read_buffer, draw_buffer0, array_buf, element_buf);
+
+  // The uniform that decides whether a UI/fullscreen draw covers anything is
+  // the clip rectangle, and the one that decides where the vertices land is
+  // the matrix. Reading both from the live program says whether the trace's
+  // last-matrix is even the matrix this draw uses.
+  auto get_uniform_loc = reinterpret_cast<GLint (*)(GLuint, const char*)>(
+      Real("glGetUniformLocation"));
+  auto get_uniform = reinterpret_cast<void (*)(GLuint, GLint, float*)>(
+      Real("glGetUniformfv"));
+  if (get_uniform_loc && get_uniform && prog >= 0) {
+    static const char* const kNames[] = {
+        "hlslcc_mtx4x4unity_ObjectToWorld",
+        "hlslcc_mtx4x4unity_MatrixVP",
+        "hlslcc_mtx4x4glstate_matrix_projection",
+        "_ClipRect",
+        "_Color",
+        "_MainTex_ST",
+    };
+    for (const char* name : kNames) {
+      const GLint loc =
+          get_uniform_loc(static_cast<GLuint>(prog), name);
+      if (loc < 0) continue;
+      float v[16] = {0};
+      // A vec4 array element is four floats; reading the base location only
+      // fills the first row, and the translation row -- the one that says
+      // whether w is 1 -- is at loc + 3.
+      const bool is_matrix = strstr(name, "mtx4x4") != nullptr;
+      if (is_matrix) {
+        for (int i = 0; i < 4; ++i)
+          get_uniform(static_cast<GLuint>(prog), loc + i, v + i * 4);
+      } else {
+        get_uniform(static_cast<GLuint>(prog), loc, v);
+      }
+      fprintf(stderr,
+              "[gl]   uniform %-38s loc=%d"
+              " % .4f % .4f % .4f % .4f | % .4f % .4f % .4f % .4f\n",
+              name, loc, v[0], v[1], v[2], v[3], v[12], v[13], v[14], v[15]);
+    }
+  }
 }
 
 // Which guest code issued a draw. The census says which texture a layer uses
@@ -340,7 +687,11 @@ void ShowVertices(unsigned texture, GLsizei count, GLenum type,
   // one carrying world coordinates identifies itself.
   GLint ibuf = 0;
   get_int(0x8895 /* ELEMENT_ARRAY_BUFFER_BINDING */, &ibuf);
-  struct Attr { GLint size, stride, buf; void* base; };
+  auto bind_buf = reinterpret_cast<void (*)(GLenum, GLuint)>(
+      Real("glBindBuffer"));
+  GLint cur_abuf = 0;
+  get_int(0x8894 /* ARRAY_BUFFER_BINDING */, &cur_abuf);
+  struct Attr { GLint size, stride, buf, type; void* base; };
   Attr attrs[8] = {};
   for (int a = 0; a < 8; ++a) {
     GLint on = 0;
@@ -348,6 +699,7 @@ void ShowVertices(unsigned texture, GLsizei count, GLenum type,
     if (!on) continue;
     get_attr(static_cast<GLuint>(a), 0x8623, &attrs[a].size);
     get_attr(static_cast<GLuint>(a), 0x8624, &attrs[a].stride);
+    get_attr(static_cast<GLuint>(a), 0x8625, &attrs[a].type);
     get_attr(static_cast<GLuint>(a), 0x889F, &attrs[a].buf);
     get_attr_ptr(static_cast<GLuint>(a), 0x8645, &attrs[a].base);
   }
@@ -372,8 +724,11 @@ void ShowVertices(unsigned texture, GLsizei count, GLenum type,
 
   if (!spread)
     fprintf(stderr,
-            "[gl] texture %u: size=%d stride=%d vbuf=%d ibuf=%d count=%d\n",
-            texture, size, stride, vbuf, ibuf, count);
+            "[gl] texture %u: a0 size=%d stride=%d buf=%d a1 size=%d"
+            " stride=%d buf=%d ibuf=%d count=%d array_bound=%d\n",
+            texture, attrs[0].size, attrs[0].stride, attrs[0].buf,
+            attrs[1].size, attrs[1].stride, attrs[1].buf, ibuf, count,
+            cur_abuf);
   for (int k = 0; k < take; k += (spread ? 6 : 1)) {
     unsigned long v = 0;
     if (wide == 4) { unsigned t; memcpy(&t, idx.data() + k * 4, 4); v = t; }
@@ -450,6 +805,13 @@ void ShowVertices(unsigned texture, GLsizei count, GLenum type,
                          static_cast<size_t>(attrs[a].stride);
       const size_t nbytes = sizeof(float) *
                             (attrs[a].size > 4 ? 4 : attrs[a].size);
+      // Read from the buffer the attribute actually names, not from whatever
+      // happens to be bound now: the two are often different by draw time.
+      GLint bound = cur_abuf;
+      if (attrs[a].buf && attrs[a].buf != cur_abuf && bind_buf) {
+        bind_buf(0x8892, static_cast<GLuint>(attrs[a].buf));
+        bound = attrs[a].buf;
+      }
       if (attrs[a].buf)
         get_sub(0x8892,
                 static_cast<intptr_t>(
@@ -458,8 +820,18 @@ void ShowVertices(unsigned texture, GLsizei count, GLenum type,
       else if (attrs[a].base)
         memcpy(f, static_cast<const unsigned char*>(attrs[a].base) + off,
                nbytes);
-      fprintf(stderr, "[gl]     attr %d size %d:  % .3f % .3f % .3f % .3f\n",
-              a, attrs[a].size, f[0], f[1], f[2], f[3]);
+      if (bound != cur_abuf && bind_buf)
+        bind_buf(0x8892, static_cast<GLuint>(cur_abuf));
+      fprintf(stderr,
+              "[gl]     attr %d size %d type %#x buf %d:"
+              "  % .3f % .3f % .3f % .3f\n",
+              a, attrs[a].size, attrs[a].type, attrs[a].buf, f[0], f[1], f[2],
+              f[3]);
+      if (attrs[a].type == 0x1401 /* GL_UNSIGNED_BYTE */) {
+        const unsigned char* b = reinterpret_cast<const unsigned char*>(f);
+        fprintf(stderr, "[gl]       bytes %u %u %u %u\n", b[0], b[1], b[2],
+                b[3]);
+      }
     }
   }
 }
@@ -611,26 +983,185 @@ bool IndicesAreUnusable(const void* indices) {
   return false;
 }
 
+void DrawArrays(GLenum mode, GLint first, GLsizei count) {
+  const unsigned bound = BoundTexture();
+  if (TraceFrame() && g_frame == TraceFrame()) {
+    TraceThisDraw(bound, static_cast<int>(count));
+    fprintf(stderr, "[gl]   draw arrays first=%d count=%d\n", first, count);
+  }
+  auto real = reinterpret_cast<void (*)(GLenum, GLint, GLsizei)>(
+      Real("glDrawArrays"));
+  if (real) real(mode, first, count);
+}
+
+// A diagnostic, off unless asked for: give the UI shader an orthographic
+// transform that maps its own 1500-unit quad to the whole viewport. If the
+// texture appears, the draw path and the sampling are sound and only the
+// transform the engine supplied is wrong.
+void ApplyUiOrtho() {
+  static const bool on = getenv("ARC_GL_UI_ORTHO") != nullptr;
+  if (!on) return;
+  auto get_int = reinterpret_cast<void (*)(GLenum, GLint*)>(
+      Real("glGetIntegerv"));
+  auto get_loc = reinterpret_cast<GLint (*)(GLuint, const char*)>(
+      Real("glGetUniformLocation"));
+  auto uniform4 = reinterpret_cast<void (*)(GLint, GLsizei, const float*)>(
+      Real("glUniform4fv"));
+  auto is_on = reinterpret_cast<unsigned char (*)(GLenum)>(Real("glIsEnabled"));
+  auto disable = reinterpret_cast<void (*)(GLenum)>(Real("glDisable"));
+  if (!get_int || !get_loc || !uniform4) return;
+  GLint prog = -1;
+  get_int(0x8B8D /* GL_CURRENT_PROGRAM */, &prog);
+  if (prog < 0) return;
+  if (get_loc(static_cast<GLuint>(prog), "_ClipRect") < 0) return;
+  GLint loc = get_loc(static_cast<GLuint>(prog),
+                      "hlslcc_mtx4x4unity_ObjectToWorld");
+  if (loc >= 0) {
+    const float m[16] = {1.0f / 750.0f, 0, 0, 0, 0, 1.0f / 750.0f, 0, 0,
+                         0, 0, 1, 0, 0, 0, 0, 1};
+    uniform4(loc, 4, m);
+  }
+  const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  loc = get_loc(static_cast<GLuint>(prog), "hlslcc_mtx4x4unity_MatrixVP");
+  if (loc >= 0) uniform4(loc, 4, identity);
+  loc = get_loc(static_cast<GLuint>(prog),
+                "hlslcc_mtx4x4glstate_matrix_projection");
+  if (loc >= 0) uniform4(loc, 4, identity);
+  if (is_on && is_on(0x0B71 /* GL_DEPTH_TEST */) && disable) disable(0x0B71);
+}
+
 void DrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
   if (IndicesAreUnusable(indices)) return;
   const unsigned bound = BoundTexture();
+  { static const bool trace_final = getenv("ARC_TRACE_FINAL") != nullptr;
+    if (trace_final) {
+      auto gi = reinterpret_cast<void (*)(GLenum, GLint*)>(Real("glGetIntegerv"));
+      GLint fb = -1;
+      if (gi) gi(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &fb);
+      static int shown;
+      if (fb == 0 && ++shown <= 12)
+        fprintf(stderr, "[final] fb=0 draw count=%d tex=%u\n", count, bound);
+    } }
   if (TextureIsSkipped(bound)) return;
+  ApplyUiOrtho();
   TraceThisDraw(bound, static_cast<int>(count));
   WhoDrew(bound);
   ShowVertices(bound, count, type, indices);
   NoteDraw();
-  auto real = reinterpret_cast<void (*)(GLenum, GLsizei, GLenum, const void*)>(
+  static auto real = reinterpret_cast<void (*)(GLenum, GLsizei, GLenum,
+                                               const void*)>(
       Real("glDrawElements"));
-  auto get_error = reinterpret_cast<GLenum (*)()>(Real("glGetError"));
-  static int left = 8;
+  static auto get_error = reinterpret_cast<GLenum (*)()>(Real("glGetError"));
+  static auto is_on =
+      reinterpret_cast<unsigned char (*)(GLenum)>(Real("glIsEnabled"));
+  static auto enable = reinterpret_cast<void (*)(GLenum)>(Real("glEnable"));
+  static auto disable = reinterpret_cast<void (*)(GLenum)>(Real("glDisable"));
+  static const bool no_depth = getenv("ARC_GL_NO_DEPTH") != nullptr;
+  // Only the no-depth experiment needs the current state; without it this is a
+  // driver query per draw for nothing.
+  const bool depth_was_on =
+      no_depth && is_on && is_on(0x0B71 /* GL_DEPTH_TEST */);
+  if (no_depth && depth_was_on && disable) disable(0x0B71);
+  static int left = GlTraceErrors() ? 8 : 0;
   if (left > 0 && get_error) while (get_error()) {}
   if (real) real(mode, count, type, indices);
+  if (no_depth && depth_was_on && enable) enable(0x0B71);
+  if (getenv("ARC_GL_READBACK")) {
+    auto read = reinterpret_cast<void (*)(GLint, GLint, GLsizei, GLsizei, GLenum,
+                                          GLenum, void*)>(
+        Real("glReadPixels"));
+    GLint fb = -1;
+    auto get_int = reinterpret_cast<void (*)(GLenum, GLint*)>(
+        Real("glGetIntegerv"));
+    if (get_int) get_int(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &fb);
+    if (read) {
+      unsigned char corner[4] = {0, 0, 0, 0};
+      unsigned char center[4] = {0, 0, 0, 0};
+      read(0, 0, 1, 1, 0x1908 /* GL_RGBA */, 0x1401 /* GL_UNSIGNED_BYTE */,
+           corner);
+      read(640, 360, 1, 1, 0x1908, 0x1401, center);
+      fprintf(stderr,
+              "[gl]   readback fbo=%d corner=%d,%d,%d,%d center=%d,%d,%d,%d\n",
+              fb, corner[0], corner[1], corner[2], corner[3], center[0],
+              center[1], center[2], center[3]);
+    }
+  }
   if (left <= 0) return;
   const GLenum e = get_error ? get_error() : 0;
   if (e) {
     --left;
     fprintf(stderr, "glDrawElements(mode=%#x count=%d) -> GL error %#x\n", mode,
             count, e);
+    // GL_INVALID_FRAMEBUFFER_OPERATION leaves the state that caused it behind.
+    // The binding and attachment names say whether the engine bound an FBO at
+    // all and which object made it incomplete; without them the next step is
+    // guesswork over every texture format the engine might have used.
+    if (e == 0x506) {
+      auto get_int = reinterpret_cast<void (*)(GLenum, GLint*)>(
+          Real("glGetIntegerv"));
+      auto check = reinterpret_cast<GLenum (*)(GLenum)>(
+          Real("glCheckFramebufferStatus"));
+      auto get_att = reinterpret_cast<void (*)(GLenum, GLenum, GLenum, GLint*)>(
+          Real("glGetFramebufferAttachmentParameteriv"));
+      GLint draw_fb = -1, read_fb = -1;
+      if (get_int) {
+        get_int(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &draw_fb);
+        get_int(0x8CAA /* READ_FRAMEBUFFER_BINDING */, &read_fb);
+      }
+      const GLenum status = check ? check(0x8D40 /* GL_FRAMEBUFFER */) : 0;
+      fprintf(stderr,
+              "  fbo draw=%d read=%d status=%#x (complete=%#x)\n", draw_fb,
+              read_fb, status, 0x8CD5u);
+      if (get_att && draw_fb) {
+        static const struct {
+          GLenum at;
+          const char* name;
+        } kAtts[] = {{0x8CE0, "color0"}, {0x8D00, "depth"},
+                     {0x8D20, "stencil"}};
+        for (const auto& a : kAtts) {
+          GLint type = -1, name = 0;
+          get_att(0x8D40, a.at, 0x8CD0 /* OBJECT_TYPE */, &type);
+          if (type == 0 /* GL_NONE */) continue;
+          get_att(0x8D40, a.at, 0x8CD1 /* OBJECT_NAME */, &name);
+          fprintf(stderr, "  %s type=%#x object=%d\n", a.name, type, name);
+          // GL_FRAMEBUFFER_UNSUPPORTED is the driver rejecting the combination
+          // of internal formats, not a missing attachment. The format is the
+          // only part that says which one to translate.
+          if (type == 0x1702 /* GL_TEXTURE */) {
+            auto bind_tex = reinterpret_cast<void (*)(GLenum, GLuint)>(
+                Real("glBindTexture"));
+            auto get_tex = reinterpret_cast<void (*)(GLenum, GLint, GLenum,
+                                                     GLint*)>(
+                Real("glGetTexLevelParameteriv"));
+            GLint prev = 0, fmt = 0, w = 0, h = 0;
+            if (get_int) get_int(0x8069 /* TEXTURE_BINDING_2D */, &prev);
+            if (bind_tex) bind_tex(0x0DE1, static_cast<GLuint>(name));
+            if (get_tex) {
+              get_tex(0x0DE1, 0, 0x1003 /* INTERNAL_FORMAT */, &fmt);
+              get_tex(0x0DE1, 0, 0x1000 /* WIDTH */, &w);
+              get_tex(0x0DE1, 0, 0x1001 /* HEIGHT */, &h);
+            }
+            if (bind_tex) bind_tex(0x0DE1, static_cast<GLuint>(prev));
+            fprintf(stderr, "    texture internal=%#x %dx%d\n", fmt, w, h);
+          } else if (type == 0x8D41 /* GL_RENDERBUFFER */) {
+            auto bind_rb = reinterpret_cast<void (*)(GLenum, GLuint)>(
+                Real("glBindRenderbuffer"));
+            auto get_rb = reinterpret_cast<void (*)(GLenum, GLenum, GLint*)>(
+                Real("glGetRenderbufferParameteriv"));
+            GLint prev = 0, fmt = 0, w = 0, h = 0;
+            if (get_int) get_int(0x8CA7 /* RENDERBUFFER_BINDING */, &prev);
+            if (bind_rb) bind_rb(0x8D41, static_cast<GLuint>(name));
+            if (get_rb) {
+              get_rb(0x8D41, 0x8D44 /* INTERNAL_FORMAT */, &fmt);
+              get_rb(0x8D41, 0x8D42 /* WIDTH */, &w);
+              get_rb(0x8D41, 0x8D43 /* HEIGHT */, &h);
+            }
+            if (bind_rb) bind_rb(0x8D41, static_cast<GLuint>(prev));
+            fprintf(stderr, "    renderbuffer internal=%#x %dx%d\n", fmt, w, h);
+          }
+        }
+      }
+    }
   }
 }
 
@@ -638,15 +1169,184 @@ void DrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) 
 // does not know, and the call that carries it leaves the texture at whatever
 // it was -- which is the transparent black a fresh texture starts as, drawn
 // without complaint over every frame after.
+void RenderbufferStorage(GLenum target, GLenum internal, GLsizei w, GLsizei h) {
+  static auto real = reinterpret_cast<void (*)(GLenum, GLenum, GLsizei, GLsizei)>(
+      Real("glRenderbufferStorage"));
+  static auto get_error = reinterpret_cast<GLenum (*)()>(Real("glGetError"));
+  static int left = GlTraceErrors() ? 8 : 0;
+  if (left > 0 && get_error)
+    while (get_error()) {
+    }
+  if (real) real(target, internal, w, h);
+  if (left <= 0) return;
+  const GLenum e = get_error ? get_error() : 0;
+  if (e) {
+    --left;
+    fprintf(stderr,
+            "glRenderbufferStorage(internal=%#x %dx%d) -> GL error %#x\n",
+            internal, w, h, e);
+  }
+}
+
+// AMD's Windows GL driver reports GL_FRAMEBUFFER_UNSUPPORTED for an FBO with
+// separate depth and stencil renderbuffers, which is exactly what the GLES2
+// renderer creates. A single GL_DEPTH24_STENCIL8 renderbuffer attached to both
+// points is complete on that driver, and carries the same depth and stencil
+// bits the engine asked for. This is a host-driver restriction, not an engine
+// bug, so the translation belongs here and not in the title.
+struct FboDepthStencil {
+  GLuint depth = 0;
+  GLuint stencil = 0;
+  GLuint combined = 0;
+  GLsizei width = 0;
+  GLsizei height = 0;
+};
+std::mutex g_fbo_lock;
+std::map<GLuint, FboDepthStencil> g_fbo_state;
+
+void QueryRenderbufferSize(GLuint rb, GLsizei* w, GLsizei* h) {
+  auto get_int = reinterpret_cast<void (*)(GLenum, GLint*)>(
+      Real("glGetIntegerv"));
+  auto bind_rb = reinterpret_cast<void (*)(GLenum, GLuint)>(
+      Real("glBindRenderbuffer"));
+  auto get_rb = reinterpret_cast<void (*)(GLenum, GLenum, GLint*)>(
+      Real("glGetRenderbufferParameteriv"));
+  if (!bind_rb || !get_rb) return;
+  GLint prev = 0;
+  if (get_int) get_int(0x8CA7 /* RENDERBUFFER_BINDING */, &prev);
+  bind_rb(0x8D41, rb);
+  get_rb(0x8D41, 0x8D42 /* WIDTH */, w);
+  get_rb(0x8D41, 0x8D43 /* HEIGHT */, h);
+  bind_rb(0x8D41, static_cast<GLuint>(prev));
+}
+
+GLuint MakeCombinedDepthStencil(GLsizei w, GLsizei h) {
+  auto gen_rb = reinterpret_cast<void (*)(GLsizei, GLuint*)>(
+      Real("glGenRenderbuffers"));
+  auto bind_rb = reinterpret_cast<void (*)(GLenum, GLuint)>(
+      Real("glBindRenderbuffer"));
+  auto storage = reinterpret_cast<void (*)(GLenum, GLenum, GLsizei, GLsizei)>(
+      Real("glRenderbufferStorage"));
+  auto get_int = reinterpret_cast<void (*)(GLenum, GLint*)>(
+      Real("glGetIntegerv"));
+  if (!gen_rb || !bind_rb || !storage) return 0;
+  GLuint rb = 0;
+  gen_rb(1, &rb);
+  if (!rb) return 0;
+  GLint prev = 0;
+  if (get_int) get_int(0x8CA7, &prev);
+  bind_rb(0x8D41, rb);
+  storage(0x8D41, 0x88F0 /* GL_DEPTH24_STENCIL8 */, w > 0 ? w : 1,
+          h > 0 ? h : 1);
+  bind_rb(0x8D41, static_cast<GLuint>(prev));
+  fprintf(stderr, "[gl] fbo depth/stencil merged into renderbuffer %u (%dx%d)\n",
+          rb, w, h);
+  return rb;
+}
+
+void FramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum rbtarget,
+                             GLuint rb) {
+  auto real = reinterpret_cast<void (*)(GLenum, GLenum, GLenum, GLuint)>(
+      Real("glFramebufferRenderbuffer"));
+  if (!real) return;
+  // ARC_FBO_MERGE=0 leaves the engine's separate depth and stencil attachments
+  // alone, which is what a build without the driver workaround did. It is a
+  // diagnostic for telling a merged-attachment stall from an engine one.
+  static const bool merge = [] {
+    const char* v = std::getenv("ARC_FBO_MERGE");
+    return !v || std::atoi(v) != 0;
+  }();
+  if (!merge) {
+    real(target, attachment, rbtarget, rb);
+    return;
+  }
+  const bool is_depth = attachment == 0x8D00 /* DEPTH_ATTACHMENT */;
+  const bool is_stencil = attachment == 0x8D20 /* STENCIL_ATTACHMENT */;
+  if ((!is_depth && !is_stencil) || rbtarget != 0x8D41 || rb == 0) {
+    real(target, attachment, rbtarget, rb);
+    return;
+  }
+  auto get_int = reinterpret_cast<void (*)(GLenum, GLint*)>(
+      Real("glGetIntegerv"));
+  const GLenum binding_query =
+      target == 0x8CA8 /* READ_FRAMEBUFFER */ ? 0x8CAA : 0x8CA6;
+  GLint fb = 0;
+  if (get_int) get_int(binding_query, &fb);
+  if (fb == 0) {
+    real(target, attachment, rbtarget, rb);
+    return;
+  }
+
+  std::lock_guard<std::mutex> held(g_fbo_lock);
+  FboDepthStencil& s = g_fbo_state[static_cast<GLuint>(fb)];
+  GLsizei w = 0, h = 0;
+  QueryRenderbufferSize(rb, &w, &h);
+  if (w > 0 && h > 0) {
+    s.width = w;
+    s.height = h;
+  }
+  if (is_depth)
+    s.depth = rb;
+  else
+    s.stencil = rb;
+
+  if (s.depth && s.stencil && s.depth != s.stencil) {
+    if (!s.combined) {
+      s.combined = MakeCombinedDepthStencil(s.width, s.height);
+    }
+    if (s.combined) {
+      real(target, 0x8D00, 0x8D41, s.combined);
+      real(target, 0x8D20, 0x8D41, s.combined);
+      return;
+    }
+  }
+  real(target, attachment, rbtarget, rb);
+}
+
+void DeleteFramebuffers(GLsizei n, const GLuint* fbs) {
+  auto del_fb = reinterpret_cast<void (*)(GLsizei, const GLuint*)>(
+      Real("glDeleteFramebuffers"));
+  auto del_rb = reinterpret_cast<void (*)(GLsizei, const GLuint*)>(
+      Real("glDeleteRenderbuffers"));
+  if (fbs) {
+    std::lock_guard<std::mutex> held(g_fbo_lock);
+    for (GLsizei i = 0; i < n; ++i) {
+      auto it = g_fbo_state.find(fbs[i]);
+      if (it == g_fbo_state.end()) continue;
+      if (it->second.combined && del_rb)
+        del_rb(1, &it->second.combined);
+      g_fbo_state.erase(it);
+    }
+  }
+  if (del_fb) del_fb(n, fbs);
+}
+
+void DeleteRenderbuffers(GLsizei n, const GLuint* rbs) {
+  auto del_rb = reinterpret_cast<void (*)(GLsizei, const GLuint*)>(
+      Real("glDeleteRenderbuffers"));
+  if (rbs) {
+    std::lock_guard<std::mutex> held(g_fbo_lock);
+    for (GLsizei i = 0; i < n; ++i) {
+      for (auto& entry : g_fbo_state) {
+        FboDepthStencil& s = entry.second;
+        if (s.depth == rbs[i]) s.depth = 0;
+        if (s.stencil == rbs[i]) s.stencil = 0;
+      }
+    }
+  }
+  if (del_rb) del_rb(n, rbs);
+}
+
 void TexImage2D(GLenum target, GLint level, GLint internal, GLsizei w,
                 GLsizei h, GLint border, GLenum format, GLenum type,
                 const void* pixels) {
   if (level == 0) NoteTexture(static_cast<int>(w), static_cast<int>(h));
-  auto real = reinterpret_cast<void (*)(GLenum, GLint, GLint, GLsizei, GLsizei,
-                                        GLint, GLenum, GLenum, const void*)>(
+  static auto real = reinterpret_cast<void (*)(GLenum, GLint, GLint, GLsizei,
+                                               GLsizei, GLint, GLenum, GLenum,
+                                               const void*)>(
       Real("glTexImage2D"));
-  auto get_error = reinterpret_cast<GLenum (*)()>(Real("glGetError"));
-  static int left = 8;
+  static auto get_error = reinterpret_cast<GLenum (*)()>(Real("glGetError"));
+  static int left = GlTraceErrors() ? 8 : 0;
   // Drained first, so what comes back afterwards belongs to this call and not
   // to whatever the engine did before it.
   if (left > 0 && get_error) while (get_error()) {}
@@ -736,6 +1436,32 @@ void Uniform4fv(GLint location, GLsizei count, const float* v) {
       Real("glUniform4fv"));
   if (real) real(location, count, v);
   if (v && count >= 1) memcpy(g_last_uniform4, v, sizeof g_last_uniform4);
+  if (getenv("ARC_TRACE_GL_UNIFORMS") && v && count >= 1) {
+    auto get_int = reinterpret_cast<void (*)(GLenum, GLint*)>(
+        Real("glGetIntegerv"));
+    GLint prog = -1;
+    if (get_int) get_int(0x8B8D /* GL_CURRENT_PROGRAM */, &prog);
+    fprintf(stderr,
+            "[gl] uniform4fv tid=%lu prog=%d loc=%d count=%d = % .4f % .4f % .4f % .4f\n",
+            static_cast<unsigned long>(GetCurrentThreadId()), prog, location,
+            count, v[0], v[1], v[2], v[3]);
+    // Whether the set actually arrived: a location that the driver rejects
+    // leaves the array at zero and looks identical in the call log.
+    auto get_uniform = reinterpret_cast<void (*)(GLuint, GLint, float*)>(
+        Real("glGetUniformfv"));
+    auto get_error = reinterpret_cast<GLenum (*)()>(Real("glGetError"));
+    static int checks = 12;
+    if (get_uniform && get_error && prog >= 0 && checks > 0 && location >= 0) {
+      --checks;
+      float back[4] = {0, 0, 0, 0};
+      get_uniform(static_cast<GLuint>(prog), location, back);
+      const GLenum err = get_error();
+      fprintf(stderr,
+              "[gl]   uniform4fv back loc=%d = % .4f % .4f % .4f % .4f"
+              " error=%#x\n",
+              location, back[0], back[1], back[2], back[3], err);
+    }
+  }
 }
 
 void UniformMatrix4fv(GLint location, GLsizei count, unsigned char transpose,
@@ -748,6 +1474,17 @@ void UniformMatrix4fv(GLint location, GLsizei count, unsigned char transpose,
   // Two layers that disagree about where the world is will have set different
   // matrices, and that is visible here and nowhere else.
   if (v) memcpy(g_last_matrix, v, sizeof g_last_matrix);
+  if (getenv("ARC_TRACE_GL_UNIFORMS") && v) {
+    auto get_int = reinterpret_cast<void (*)(GLenum, GLint*)>(
+        Real("glGetIntegerv"));
+    GLint prog = -1;
+    if (get_int) get_int(0x8B8D /* GL_CURRENT_PROGRAM */, &prog);
+    fprintf(stderr,
+            "[gl] uniformMatrix4fv prog=%d loc=%d count=%d transpose=%d"
+            " = % .4f % .4f % .4f % .4f | % .4f % .4f % .4f % .4f\n",
+            prog, location, count, transpose, v[0], v[1], v[2], v[3], v[12],
+            v[13], v[14], v[15]);
+  }
   static int left = 4;
   if (!getenv("ARC_TRACE_GL") || left <= 0 || !v || location < 0) return;
   --left;
@@ -757,32 +1494,21 @@ void UniformMatrix4fv(GLint location, GLsizei count, unsigned char transpose,
             v[r * 4 + 2], v[r * 4 + 3]);
 }
 
-// Desktop GL keeps generic attribute 0 aliased to the fixed-function vertex
-// array, and a compatibility context generates no primitives at all unless
-// array 0 is enabled. GLES has no such rule, so an engine is free to start its
-// attributes at 1 -- which this one does: position at 1, uvs at 2, colour at
-// 3. Every draw then sets correct state, raises no error, and produces nothing.
-//
-// So the indices are shifted down by one on the way through, consistently for
-// the binding and for the arrays. Index 0 arriving from the guest would have
-// nowhere to go; it never does here, and if it ever did the shift would be the
-// wrong answer rather than a silent one.
-// ponytail: a shift, not a mapping table. A title that uses 0 and 1 together
-// needs the table.
-GLuint ShiftAttrib(GLuint index) {
-  if (index) return index - 1;
-  static bool said = false;
-  if (!said) {
-    said = true;
-    fprintf(stderr, "[gl] the engine used attribute 0; not shifting it\n");
-  }
-  return 0;
-}
+// Desktop GL and GLES2 agree on attribute numbering, and this engine relies on
+// that: its UI uses 0 for position, 1 for colour and 2 for uv, while its blit
+// uses 0 for its one vertex. Renumbering 1 to 0 made colour overwrite position
+// on every UI draw, so the numbers are passed through unchanged. Attribute 0
+// is a real enabled array here, which is what a compatibility context needs.
+GLuint ShiftAttrib(GLuint index) { return index; }
 
 void BindAttribLocation(GLuint program, GLuint index, const GLchar* name) {
   auto real = reinterpret_cast<void (*)(GLuint, GLuint, const GLchar*)>(
       Real("glBindAttribLocation"));
-  if (real) real(program, ShiftAttrib(index), name);
+  const GLuint host = ShiftAttrib(index);
+  if (getenv("ARC_TRACE_GL_ATTRIBS"))
+    fprintf(stderr, "[gl] bind attrib program=%u guest=%u host=%u name=%s\n",
+            program, index, host, name ? name : "(null)");
+  if (real) real(program, host, name);
 }
 
 void VertexAttribPointer(GLuint index, GLint size, GLenum type,
@@ -791,20 +1517,32 @@ void VertexAttribPointer(GLuint index, GLint size, GLenum type,
   auto real = reinterpret_cast<void (*)(GLuint, GLint, GLenum, unsigned char,
                                         GLsizei, const void*)>(
       Real("glVertexAttribPointer"));
+  const GLuint host = ShiftAttrib(index);
+  if (getenv("ARC_TRACE_GL_ATTRIBS"))
+    fprintf(stderr,
+            "[gl] attrib pointer guest=%u host=%u size=%d type=%#x norm=%d"
+            " stride=%d ptr=%p\n",
+            index, host, size, type, normalized, stride, pointer);
   if (real)
-    real(ShiftAttrib(index), size, type, normalized, stride, pointer);
+    real(host, size, type, normalized, stride, pointer);
 }
 
 void EnableVertexAttribArray(GLuint index) {
   auto real =
       reinterpret_cast<void (*)(GLuint)>(Real("glEnableVertexAttribArray"));
-  if (real) real(ShiftAttrib(index));
+  const GLuint host = ShiftAttrib(index);
+  if (getenv("ARC_TRACE_GL_ATTRIBS"))
+    fprintf(stderr, "[gl] enable attrib guest=%u host=%u\n", index, host);
+  if (real) real(host);
 }
 
 void DisableVertexAttribArray(GLuint index) {
   auto real =
       reinterpret_cast<void (*)(GLuint)>(Real("glDisableVertexAttribArray"));
-  if (real) real(ShiftAttrib(index));
+  const GLuint host = ShiftAttrib(index);
+  if (getenv("ARC_TRACE_GL_ATTRIBS"))
+    fprintf(stderr, "[gl] disable attrib guest=%u host=%u\n", index, host);
+  if (real) real(host);
 }
 
 // A deliberate diagnostic, off unless asked for: clear to a colour nothing in
@@ -925,7 +1663,7 @@ const CtxEntry kCtxTable[] = {
 // jumping into nothing.
 uint64_t EglGetProcAddress(const char* name) {
 #if defined(ARC_HAVE_SDL2)
-  if (!name || !SDL_GL_GetCurrentContext()) return 0;
+  if (!name || !(arc::GfxAngleActive() || SDL_GL_GetCurrentContext())) return 0;
   // The same two names are intercepted here as in the import table: an engine
   // that resolves them this way instead would otherwise reach the driver with
   // GLSL ES in hand.
@@ -942,8 +1680,7 @@ uint64_t EglGetProcAddress(const char* name) {
   // An import is announced when it binds at load time; a pointer produced this
   // late has no such moment, and without one the branch lands on host code the
   // dispatcher has never heard of and is reported as going nowhere.
-  return ShimHandOut(reinterpret_cast<uint64_t>(SDL_GL_GetProcAddress(name)),
-                     name);
+  return ShimHandOut(reinterpret_cast<uint64_t>(Real(name)), name);
 #else
   (void)name;
   return 0;
@@ -967,17 +1704,37 @@ uint64_t ShimResolveGL(const char* name) {
     if (strcmp(e.name, name) == 0) return reinterpret_cast<uint64_t>(e.fn);
   // No context, no GL driver to ask. The window is opened before the engine is
   // loaded precisely so this can answer.
-  if (!SDL_GL_GetCurrentContext()) return 0;
+  if (!(GfxAngleActive() || SDL_GL_GetCurrentContext())) return 0;
+  if (strcmp(name, "glGetString") == 0)
+    return reinterpret_cast<uint64_t>(&GlesGetString);
+  if (strcmp(name, "glGetStringi") == 0)
+    return reinterpret_cast<uint64_t>(&GlesGetStringi);
+  if (strcmp(name, "glGetIntegerv") == 0)
+    return reinterpret_cast<uint64_t>(&GlesGetIntegerv);
   if (strcmp(name, "glShaderSource") == 0)
     return reinterpret_cast<uint64_t>(&ShaderSource);
+  if (strcmp(name, "glCreateShader") == 0)
+    return reinterpret_cast<uint64_t>(&CreateShader);
+  if (strcmp(name, "glCreateProgram") == 0)
+    return reinterpret_cast<uint64_t>(&CreateProgram);
   if (strcmp(name, "glCompileShader") == 0)
     return reinterpret_cast<uint64_t>(&CompileShader);
   if (strcmp(name, "glLinkProgram") == 0)
     return reinterpret_cast<uint64_t>(&LinkProgram);
+  if (strcmp(name, "glDrawArrays") == 0)
+    return reinterpret_cast<uint64_t>(&DrawArrays);
   if (strcmp(name, "glDrawElements") == 0)
     return reinterpret_cast<uint64_t>(&DrawElements);
   if (strcmp(name, "glTexImage2D") == 0)
     return reinterpret_cast<uint64_t>(&TexImage2D);
+  if (strcmp(name, "glRenderbufferStorage") == 0)
+    return reinterpret_cast<uint64_t>(&RenderbufferStorage);
+  if (strcmp(name, "glFramebufferRenderbuffer") == 0)
+    return reinterpret_cast<uint64_t>(&FramebufferRenderbuffer);
+  if (strcmp(name, "glDeleteFramebuffers") == 0)
+    return reinterpret_cast<uint64_t>(&DeleteFramebuffers);
+  if (strcmp(name, "glDeleteRenderbuffers") == 0)
+    return reinterpret_cast<uint64_t>(&DeleteRenderbuffers);
   if (strcmp(name, "glTexParameterf") == 0)
     return reinterpret_cast<uint64_t>(&TexParameterf);
   if (strcmp(name, "glUniformMatrix4fv") == 0)
@@ -998,7 +1755,7 @@ uint64_t ShimResolveGL(const char* name) {
     return reinterpret_cast<uint64_t>(&EnableVertexAttribArray);
   if (strcmp(name, "glDisableVertexAttribArray") == 0)
     return reinterpret_cast<uint64_t>(&DisableVertexAttribArray);
-  return reinterpret_cast<uint64_t>(SDL_GL_GetProcAddress(name));
+  return reinterpret_cast<uint64_t>(Real(name));
 #else
   (void)name;
   return 0;

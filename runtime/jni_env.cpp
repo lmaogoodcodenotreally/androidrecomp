@@ -8,6 +8,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <string>
@@ -53,6 +54,23 @@ uint64_t g_vm_table = reinterpret_cast<uint64_t>(g_vm_slots);
 std::atomic<size_t> g_hits[kSlots];
 std::atomic<size_t> g_total;
 
+// Native methods the guest registered through RegisterNatives.
+//
+// Unity does not export its player entry points as Java_* symbols; it builds a
+// JNINativeMethod table and hands it to the VM during JNI_OnLoad. The shim used
+// to discard that call, which is right for a boot that only needs the engine's
+// constructors and wrong for a port that has to drive a frame. Keeping the
+// triples gives the host a name to call by; the class name is not part of the
+// registration call and the shim's FindClass handles are opaque, so name plus
+// signature is what identifies a method.
+struct RegisteredNative {
+  std::string name;
+  std::string signature;
+  uint64_t fn = 0;
+};
+std::mutex g_natives_lock;
+std::vector<RegisteredNative> g_natives;
+
 // --- the arena -------------------------------------------------------------
 // Handles are blocks from a zeroed arena, reserved low in the address space. A
 // handle is opaque in principle, but code with a 32-bit lineage stores one in
@@ -80,6 +98,49 @@ unsigned char* ReserveLowArena() {
 // as something no one stored -- which surfaces far away as a branch to an
 // address that was never in any mapped image.
 std::mutex g_arena_lock;
+size_t g_active_slot = 0;
+bool g_trace_next_alloc = false;
+
+// What an object was constructed with. See `arc_jni_ctor_text`, which is the
+// only reader. Declared up here because the arena recycles and `Allocate` has
+// to forget the previous occupant.
+//
+// The class is kept beside the argument because the two together are the
+// identity: a command object is a class that names the command and an argument
+// that names the conversation. Either alone would match something else -- the
+// arena has held a `java.lang.String` constructed from the word "Log" at an
+// address that later belonged to a request.
+struct CtorRecord {
+  std::string klass;
+  std::string first;
+};
+std::mutex g_ctor_lock;
+std::map<uint64_t, CtorRecord> g_ctor_text;
+
+// --- the synthetic MotionEvent ---------------------------------------------
+//
+// A touch reaches Unity through Java on Android: UnityPlayer.onTouchEvent
+// passes the MotionEvent to the registered `nativeInjectEvent`, and the native
+// body reads it back through JNI. There is no Java here, so the event has to
+// be a stand-in that answers the same questions. Its fields live beside the
+// handle for the same reason a constructor's argument does: the handle is an
+// arena block, and `IsInstanceOf` reads a handle's text as its class name --
+// which is exactly what the event must be, "android/view/MotionEvent".
+struct MotionEventState {
+  int action = 0;
+  float x = 0, y = 0;
+  int64_t down_time = 0, event_time = 0;
+};
+std::mutex g_motion_lock;
+std::map<uint64_t, MotionEventState> g_motion_events;
+
+bool MotionEventStateFor(uint64_t handle, MotionEventState* out) {
+  std::lock_guard<std::mutex> held(g_motion_lock);
+  const auto it = g_motion_events.find(handle);
+  if (it == g_motion_events.end()) return false;
+  if (out) *out = it->second;
+  return true;
+}
 
 uint64_t Allocate() {
   std::lock_guard<std::mutex> held(g_arena_lock);
@@ -90,6 +151,18 @@ uint64_t Allocate() {
   if (g_arena_used + kBlock > kArenaSize) g_arena_used = 0;  // wrap; nothing frees
   const uint64_t p = reinterpret_cast<uint64_t>(g_arena + g_arena_used);
   g_arena_used += kBlock;
+  // The arena wraps after five hundred blocks and nothing is freed, so this
+  // address has held other things. An identity recorded for the last occupant
+  // would otherwise answer for this one -- it is how a callback id was read as
+  // the string "Log", left over from a `java.lang.String`.
+  {
+    std::lock_guard<std::mutex> ctor_held(g_ctor_lock);
+    g_ctor_text.erase(p);
+  }
+  {
+    std::lock_guard<std::mutex> motion_held(g_motion_lock);
+    g_motion_events.erase(p);
+  }
   // Cleared, because the arena wraps and nothing frees: a handle handed back
   // for a question we could not answer is meant to read as empty, and an
   // uncleared block reads as whatever string last occupied it. That is worse
@@ -97,19 +170,66 @@ uint64_t Allocate() {
   // the program. It arrived here as a proxy host named "LandDataVersion",
   // which the network stack then spent every request trying to resolve.
   memset(reinterpret_cast<void*>(p), 0, kBlock);
+  if (g_trace_next_alloc && g_active_slot) {
+    g_trace_next_alloc = false;
+    fprintf(stderr, "[jni] next alloc %#llx from slot %zu\n",
+            static_cast<unsigned long long>(p), g_active_slot);
+  }
   return p;
 }
 
 // A string handle carries its text, because something will measure it. An
 // empty one is not harmless: the engine takes the length, subtracts one, and
 // hands the result to memcpy.
+//
+// The last word of the block is a marker that says this handle is a string.
+// GetStringUTFChars has a fallback for opaque handles that would otherwise
+// read as empty -- the boot.config Scanner is the case it exists for -- and
+// without the marker that fallback cannot tell a legitimate empty string (a
+// Locale with no language tag, say) from a handle that never carried text at
+// all. The fallback then hands back whichever file was read last, which is how
+// a language tag became the whole boot config.
+constexpr uint64_t kTextHandleMagic = 0x5458542D48414E44ull;  // "TXTHAND"
+
 uint64_t AllocateText(const char* text) {
   const uint64_t p = Allocate();
   if (p && text) {
     const size_t n = strlen(text);
-    memcpy(reinterpret_cast<void*>(p), text, n < kBlock ? n + 1 : kBlock - 1);
+    const size_t cap = kBlock - 2 * sizeof(uint64_t);
+    const size_t copy = n < cap ? n : cap - 1;
+    memcpy(reinterpret_cast<void*>(p), text, copy);
+    reinterpret_cast<unsigned char*>(p)[copy] = 0;
   }
+  if (p) {
+    *reinterpret_cast<uint64_t*>(p + kBlock - sizeof(uint64_t)) =
+        kTextHandleMagic;
+  }
+  if (p && g_active_slot && (!text || !*text))
+    fprintf(stderr, "[jni] empty text block %#llx from slot %zu\n",
+            static_cast<unsigned long long>(p), g_active_slot);
   return p;
+}
+
+// Unity's Java bootstrap reads bin/Data/boot.config through AssetManager.open
+// and java.util.Scanner before it ever reaches native code. A generic opaque
+// handle makes that file read back empty, and Unity treats an empty boot
+// config as a fatal startup error. The host already knows where the extracted
+// assets live, so answer those two calls from the file itself.
+std::mutex g_asset_text_lock;
+std::string g_last_asset_text;
+std::string g_last_utf8;
+
+std::string ReadAssetFile(const char* name) {
+  const char* root = arc::ShimAssetRoot();
+  if (!root || !*root || !name) return {};
+  const char* p = name;
+  while (*p == '/') ++p;
+  if (strncmp(p, "assets/", 7) == 0) p += 7;
+  std::ifstream in(std::filesystem::path(root) / p, std::ios::binary);
+  if (!in) return {};
+  std::string text((std::istreambuf_iterator<char>(in)),
+                   std::istreambuf_iterator<char>());
+  return text;
 }
 
 // --- the object the engine is actually asking about ------------------------
@@ -140,10 +260,18 @@ const Field kFields[] = {
     // that comes out negative and goes straight into memcpy as -1, which reads
     // until it leaves the heap. The value is ours to choose; the shape is not.
     {"appVersion", 's', "1.0.0", 0, 0},
+    {"versionName", 's', "1.0.0", 0, 0},
+    {"version", 's', "1.0.0", 0, 0},
+    {"name", 's', "Mario Kart Tour", 0, 0},
+    {"url", 's', "http://127.0.0.1:8443/", 0, 0},
+    {"sessionTracker", 's', "0", 0, 0},
     {"clientVersion", 's', "1.0.0", 0, 0},
     {"deviceName", 's', "androidrecomp", 0, 0},
     {"deviceVersion", 's', "1.0.0", 0, 0},
     {"manufacturerName", 's', "generic", 0, 0},
+    {"widthPixels", 'i', nullptr, 1280, 0},
+    {"heightPixels", 'i', nullptr, 720, 0},
+    {"densityDpi", 'i', nullptr, 320, 0},
     {"language", 's', "en", 0, 0},
     {"locale", 's', "en_US", 0, 0},
     {"width", 'i', nullptr, 1280, 0},
@@ -211,11 +339,26 @@ uint64_t FieldIdFor(const char* name, const char* sig) {
 // supposed to return a path, answered with an empty string, is how a bundle
 // path becomes "/".
 //
+// The class and the signature are kept with the name. The same method name
+// means different things on different classes, and a title that hands Java a
+// *binary* argument (NPF's `UnityBridge.execute(byte[])` is the one that
+// matters here) cannot be understood from the name alone. Keeping them costs
+// one string per lookup and makes a call trace read `class.method(sig)`,
+// which is the difference between "something asked for execute" and "which
+// execute, on what, returning what".
+//
 // A deque and not a vector: names are handed out as pointers and another
 // thread may be adding one, which would move a vector's contents.
 constexpr uint64_t kMethodIdBase = 0x0E2D1000;
 std::mutex g_method_lock;
-std::deque<std::string> g_method_names;
+
+struct MethodEntry {
+  std::string name;
+  std::string owner;
+  std::string signature;
+};
+
+std::deque<MethodEntry> g_method_entries;
 std::deque<std::string> g_method_unanswered;
 
 // Java methods to report as missing, from ARC_JNI_ABSENT -- a comma-separated
@@ -234,20 +377,49 @@ bool MethodIsAbsent(const char* name) {
   return false;
 }
 
-uint64_t MethodIdFor(const char* name) {
+uint64_t MethodIdFor(const char* owner, const char* name,
+                     const char* signature) {
   const std::string wanted = name ? name : "?";
   std::lock_guard<std::mutex> held(g_method_lock);
-  for (size_t i = 0; i < g_method_names.size(); ++i)
-    if (g_method_names[i] == wanted) return kMethodIdBase + i;
-  g_method_names.push_back(wanted);
-  return kMethodIdBase + g_method_names.size() - 1;
+  for (size_t i = 0; i < g_method_entries.size(); ++i) {
+    if (g_method_entries[i].name == wanted) {
+      // The first lookup creates the id; a later one for the same name only
+      // fills in what the first one did not know, so an early id resolved
+      // before its class was recorded is not silently re-pointed.
+      if (g_method_entries[i].owner.empty() && owner)
+        g_method_entries[i].owner = owner;
+      if (g_method_entries[i].signature.empty() && signature)
+        g_method_entries[i].signature = signature;
+      return kMethodIdBase + i;
+    }
+  }
+  g_method_entries.push_back(
+      {wanted, owner ? owner : "", signature ? signature : ""});
+  return kMethodIdBase + g_method_entries.size() - 1;
+}
+
+const MethodEntry* MethodAt(uint64_t id) {
+  const uint64_t index = id - kMethodIdBase;
+  if (id < kMethodIdBase) return nullptr;
+  return index < g_method_entries.size() ? &g_method_entries[index] : nullptr;
 }
 
 const char* MethodName(uint64_t id) {
-  const uint64_t index = id - kMethodIdBase;
   std::lock_guard<std::mutex> held(g_method_lock);
-  return index < g_method_names.size() ? g_method_names[index].c_str()
-                                       : nullptr;
+  const MethodEntry* e = MethodAt(id);
+  return e ? e->name.c_str() : nullptr;
+}
+
+const char* MethodOwner(uint64_t id) {
+  std::lock_guard<std::mutex> held(g_method_lock);
+  const MethodEntry* e = MethodAt(id);
+  return e && !e->owner.empty() ? e->owner.c_str() : nullptr;
+}
+
+const char* MethodSignature(uint64_t id) {
+  std::lock_guard<std::mutex> held(g_method_lock);
+  const MethodEntry* e = MethodAt(id);
+  return e && !e->signature.empty() ? e->signature.c_str() : nullptr;
 }
 
 void NoteUnanswered(const char* name) {
@@ -313,6 +485,12 @@ const MethodText kMethodText[] = {
     {"getDeviceModel", "androidrecomp"},
     {"getCurrentLanguage", "en"},
     {"getLanguage", "en"},
+    // java.util.Locale.getDefault().toLanguageTag() is how the engine reads
+    // the device locale before IL2CPP starts. An empty answer is not "no
+    // preference" here: IL2CPP hands it to CultureInfo, which rejects it and
+    // throws while the runtime is still initialising. A well-formed BCP-47
+    // tag is the answer that lets startup continue.
+    {"toLanguageTag", "en-US"},
     {"getCountry", "US"},
     {"getVersion", "1.0"},
     // A locale variant and an absent preference are legitimately empty, and
@@ -407,6 +585,152 @@ uint64_t AllocateObjectArray(const uint64_t* items, size_t n) {
   return p;
 }
 
+// A byte array is *bytes*, not text. The engine's own arrays are ASCII paths
+// and log lines, and measuring one with strlen was right for those; a protobuf
+// command or an HTTP response is not text at all -- it carries NULs, and
+// strlen stops at the first one. So a byte array carries its own length behind
+// a magic word at the end of the block.
+//
+// The bytes still start at offset zero, and a block that holds them still ends
+// with the text marker, because some of the engine's own helpers hand a filled
+// byte array to something that reads it as a string. Keeping both views of the
+// same block is what makes the array usable as an array without breaking it as
+// a string.
+constexpr uint64_t kBytesMagic = 0x42595445A44A45ull;  // "BYTEAJE"
+constexpr size_t kBytesLengthOffset = kBlock - 3 * sizeof(uint64_t);
+constexpr size_t kBytesMagicOffset = kBlock - 2 * sizeof(uint64_t);
+constexpr size_t kBytesCapacity = kBlock - 3 * sizeof(uint64_t) - 1;
+
+bool IsByteArray(uint64_t handle) {
+  if (!handle || !arc_jni_owns(handle)) return false;
+  uint64_t magic = 0;
+  memcpy(&magic, reinterpret_cast<const void*>(handle + kBytesMagicOffset),
+         sizeof magic);
+  return magic == kBytesMagic;
+}
+
+uint64_t ByteArrayLength(uint64_t handle) {
+  uint64_t n = 0;
+  memcpy(&n, reinterpret_cast<const void*>(handle + kBytesLengthOffset),
+         sizeof n);
+  return n;
+}
+
+void SetByteArrayLength(uint64_t handle, uint64_t n) {
+  if (n > kBytesCapacity) n = kBytesCapacity;
+  memcpy(reinterpret_cast<void*>(handle + kBytesLengthOffset), &n, sizeof n);
+}
+
+uint64_t AllocateByteArray(uint64_t n) {
+  const uint64_t p = Allocate();
+  if (!p) return 0;
+  if (n > kBytesCapacity) n = kBytesCapacity;
+  const uint64_t magic = kBytesMagic, length = n;
+  memcpy(reinterpret_cast<void*>(p + kBytesMagicOffset), &magic, sizeof magic);
+  memcpy(reinterpret_cast<void*>(p + kBytesLengthOffset), &length,
+         sizeof length);
+  *reinterpret_cast<uint64_t*>(p + kBlock - sizeof(uint64_t)) =
+      kTextHandleMagic;
+  return p;
+}
+
+// --- the platform trust store ---------------------------------------------
+//
+// Unity's native TLS client does not carry a CA bundle of its own. It asks the
+// platform, and the platform's answer is Java:
+//
+//   TrustManagerFactory.getDefaultAlgorithm()  -> "X509"
+//   TrustManagerFactory.getInstance(algorithm) -> factory
+//   factory.init(keystore)                     -> (the default store)
+//   factory.getTrustManagers()                 -> TrustManager[]
+//   X509TrustManager.getAcceptedIssuers()      -> X509Certificate[]
+//   X509Certificate.getEncoded()               -> DER
+//
+// and the verifier then trusts exactly those issuers. On a device the last two
+// read the system CA store. There is no Java here, so the store is the bundle
+// the host names in SSL_CERT_FILE (or ARC_TRUST_CA): a port that points its
+// traffic at a local server points this at that server's CA, and the same code
+// path works unchanged.
+//
+// Answering these with opaque blocks, as the generic table did, made
+// getTrustManagers() a zero-length array. The verifier then had no issuer to
+// trust, every handshake failed as "not signed by a trusted CA", and a title
+// whose boot begins with a catalog check never got its answer -- which is what
+// a dialog saying the host could not be reached actually was.
+std::mutex g_trust_lock;
+bool g_trust_ready = false;
+std::vector<std::vector<unsigned char>> g_trust_certs;  // DER, one per issuer
+std::vector<uint64_t> g_trust_cert_handles;
+uint64_t g_trust_manager = 0;
+uint64_t g_trust_issuers = 0;
+
+// A PEM bundle is the shape the host already has: the same file the OpenSSL
+// side of the engine reads. Only the certificate blocks matter, so the base64
+// body between the markers is the whole parser.
+std::vector<std::vector<unsigned char>> LoadPemCertificates(const char* path) {
+  std::vector<std::vector<unsigned char>> out;
+  if (!path || !*path) return out;
+  std::ifstream in(std::filesystem::path(path), std::ios::binary);
+  if (!in) return out;
+  const std::string text((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+  static const char kBegin[] = "-----BEGIN CERTIFICATE-----";
+  static const char kEnd[] = "-----END CERTIFICATE-----";
+  size_t at = 0;
+  while (true) {
+    const size_t begin = text.find(kBegin, at);
+    if (begin == std::string::npos) break;
+    const size_t body = begin + sizeof kBegin - 1;
+    const size_t end = text.find(kEnd, body);
+    if (end == std::string::npos) break;
+    at = end + sizeof kEnd - 1;
+    std::vector<unsigned char> der;
+    int acc = 0, bits = 0;
+    for (size_t i = body; i < end; ++i) {
+      const unsigned char ch = static_cast<unsigned char>(text[i]);
+      int v;
+      if (ch >= 'A' && ch <= 'Z') v = ch - 'A';
+      else if (ch >= 'a' && ch <= 'z') v = ch - 'a' + 26;
+      else if (ch >= '0' && ch <= '9') v = ch - '0' + 52;
+      else if (ch == '+') v = 62;
+      else if (ch == '/') v = 63;
+      else continue;  // whitespace and the trailing '='
+      acc = (acc << 6) | v;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        der.push_back(static_cast<unsigned char>((acc >> bits) & 0xFF));
+      }
+    }
+    if (!der.empty()) out.push_back(std::move(der));
+  }
+  return out;
+}
+
+// Built once. The handles live in the same arena as every other answer, so
+// nothing frees them and the same array can be handed out again.
+void EnsureTrustStore() {
+  std::lock_guard<std::mutex> held(g_trust_lock);
+  if (g_trust_ready) return;
+  g_trust_ready = true;
+  const char* path = std::getenv("ARC_TRUST_CA");
+  if (!path || !*path) path = std::getenv("SSL_CERT_FILE");
+  g_trust_certs = LoadPemCertificates(path);
+  // A handle that carries its class name is an instance of the class of that
+  // name -- which is the only hierarchy this bridge can answer for.
+  g_trust_manager = AllocateText("javax/net/ssl/X509TrustManager");
+  g_trust_cert_handles.reserve(g_trust_certs.size());
+  for (size_t i = 0; i < g_trust_certs.size(); ++i)
+    g_trust_cert_handles.push_back(
+        AllocateText("java/security/cert/X509Certificate"));
+  g_trust_issuers = AllocateObjectArray(g_trust_cert_handles.data(),
+                                        g_trust_cert_handles.size());
+  static const bool trace = std::getenv("ARC_TRACE_JNI") != nullptr;
+  if (trace)
+    std::fprintf(stderr, "[jni] trust store %s: %zu certificate(s)\n",
+                 path ? path : "(none)", g_trust_certs.size());
+}
+
 // The Nimble SDK's callbacks, which on Android are delivered by Java.
 //
 // Its C++ half hands Java an object carrying a small integer id, asks Java to
@@ -492,6 +816,214 @@ uint64_t FirstOwnedArg(Arm64Ctx* c) {
   for (int i = 0; i < 6; ++i) {
     const uint64_t v = arc::ShimVaNextInt(cursor.data());
     if (v && arc_jni_owns(v)) return v;
+  }
+  return 0;
+}
+
+// The arguments of a Java call, as the JNI entry point received them.
+//
+// JNI spells every call three ways and the call site chooses: `...Method`
+// passes the arguments directly (in registers, on this ABI), `...MethodV`
+// passes a va_list, and `...MethodA` passes a jvalue[]. The JNI index says
+// which, so the arguments can be read without guessing -- which matters,
+// because the one call that decides the *identity* of every later Java call
+// (Unity's `ReflectionHelper.getMethodID`) arrives through the varargs form.
+// The three spellings are consecutive per family, but the families do not
+// start at the same offset in the table: instance calls begin at 34,
+// nonvirtual at 64 and static at 114, so the modulus differs between them. The
+// index alone still says which form a call used.
+//
+// Reading a `...V` call as a jvalue[] is not a near miss: the argument is a
+// va_list, not an array of eight-byte slots, so every argument comes back as
+// whatever those bytes happen to be. Nabe's `AndroidUtil.Copy(String, String)`
+// arrives this way, and two garbage paths read as "the pack could not be
+// copied".
+int CallForm(size_t index) {
+  const size_t base = index >= 114 ? 114 : index >= 64 ? 64 : 34;
+  if (index - base >= 30) return -1;
+  return static_cast<int>((index - base) % 3);
+}
+
+std::vector<uint64_t> CallArgs(Arm64Ctx* c, size_t index, size_t count) {
+  std::vector<uint64_t> args;
+  const int form = CallForm(index);
+  if (form < 0) return args;
+  if (form == 0) {
+    for (size_t i = 0; i < count && 3 + i < 8; ++i) args.push_back(c->x[3 + i]);
+    return args;
+  }
+  if (form == 1) {
+    if (!c->x[3]) return args;
+    std::vector<unsigned char> cursor(arc::ShimVaListSize());
+    memcpy(cursor.data(), reinterpret_cast<const void*>(c->x[3]),
+           cursor.size());
+    for (size_t i = 0; i < count; ++i)
+      args.push_back(arc::ShimVaNextInt(cursor.data()));
+    return args;
+  }
+  // jvalue[]: a union of eight bytes per element, and the integer/pointer
+  // member is where every argument the engine passes lives.
+  if (!c->x[3]) return args;
+  for (size_t i = 0; i < count; ++i) {
+    uint64_t v = 0;
+    memcpy(&v, reinterpret_cast<const void*>(c->x[3] + i * 8), sizeof v);
+    args.push_back(v);
+  }
+  return args;
+}
+
+// A handle that carries text, or nothing. Class handles and strings both do;
+// a blank stand-in does not, and refusing to read one as a string is the
+// difference between "the caller named nothing" and "the caller named
+// whatever was in the arena at that address".
+const char* HandleText(uint64_t handle) {
+  if (!handle || !arc_jni_owns(handle)) return nullptr;
+  return reinterpret_cast<const char*>(handle);
+}
+
+// What an object was constructed with. See `arc_jni_ctor_text`: a request
+// object is handed its conversation's identity as the first argument of its
+// constructor, and with no Java to keep it the handle has to.
+//
+// This is a side table and not the handle's own text on purpose. A Java object
+// is not a string, and `IsInstanceOf` reads a handle's text as its class name;
+// a `File` constructed from a path that then claimed to be that path would
+// stop being an instance of `File`. Only a caller that asks for the
+// constructor's argument gets it.
+void NoteCtorText(uint64_t handle, uint64_t klass, uint64_t first,
+                  bool has_first) {
+  const char* class_text = HandleText(klass);
+  if (!class_text || !*class_text) return;
+  std::lock_guard<std::mutex> held(g_ctor_lock);
+  CtorRecord& record = g_ctor_text[handle];
+  record.klass = class_text;
+  if (!has_first) return;
+  if (const char* first_text = HandleText(first)) {
+    record.first = first_text;
+  } else if (first < 1000000) {
+    // An id handed over as an integer rather than as a string. It names the
+    // same conversation either way, and a caller that asks which one has no
+    // other way to find out.
+    char text[24];
+    snprintf(text, sizeof text, "%llu",
+             static_cast<unsigned long long>(first));
+    record.first = text;
+  }
+}
+
+const char* CtorClassFor(uint64_t handle) {
+  std::lock_guard<std::mutex> held(g_ctor_lock);
+  const auto it = g_ctor_text.find(handle);
+  return it == g_ctor_text.end() ? nullptr : it->second.klass.c_str();
+}
+
+const char* CtorTextFor(uint64_t handle) {
+  std::lock_guard<std::mutex> held(g_ctor_lock);
+  const auto it = g_ctor_text.find(handle);
+  if (it == g_ctor_text.end() || it->second.first.empty()) return nullptr;
+  return it->second.first.c_str();
+}
+
+// A port's answers to its title's own Java classes.
+//
+// The table below answers the engine. A title's Java half is a different
+// subject: it belongs to the title, and the port is where the title lives. The
+// identity of a call is already recorded with its method id, so a handler can
+// be matched on exactly what was resolved, and this file never has to learn a
+// class name it was not told.
+struct JavaMethodHandler {
+  std::string owner;
+  std::string name;
+  std::string signature;
+  ArcJavaMethodFn fn;
+};
+
+std::mutex g_java_method_lock;
+std::vector<JavaMethodHandler> g_java_methods;
+
+ArcJavaMethodFn FindJavaMethod(const char* owner, const char* name,
+                               const char* signature) {
+  if (!name) return nullptr;
+  std::lock_guard<std::mutex> held(g_java_method_lock);
+  for (const JavaMethodHandler& h : g_java_methods) {
+    if (h.name != name) continue;
+    if (!h.owner.empty() && (!owner || h.owner != owner)) continue;
+    if (!h.signature.empty() && (!signature || h.signature != signature))
+      continue;
+    return h.fn;
+  }
+  return nullptr;
+}
+
+// An exported guest symbol, by name, remembered once found. The loader's
+// lookup walks every image's dynamic table, which is not something to do for
+// each string handed back to managed code. A miss is not remembered: the
+// runtime may simply not have finished loading when a port first asks.
+uint64_t GuestExport(const char* name) {
+  static std::mutex held_mutex;
+  static std::map<std::string, uint64_t> found;
+  {
+    std::lock_guard<std::mutex> held(held_mutex);
+    const auto it = found.find(name);
+    if (it != found.end()) return it->second;
+  }
+  const uint64_t address = arc::ShimGuestSymbol(name);
+  if (!address) return 0;
+  std::lock_guard<std::mutex> held(held_mutex);
+  found.emplace(name, address);
+  return address;
+}
+
+// A managed string, made by the runtime itself. `il2cpp_string_new` is the
+// only way to get an object the collector understands from host text.
+uint64_t GuestStringFor(const char* utf8) {
+  static const uint64_t create = GuestExport("il2cpp_string_new");
+  if (!create) return 0;
+  const uint64_t args[1] = {reinterpret_cast<uint64_t>(utf8 ? utf8 : "")};
+  return arc_call_guest(create, args, 1);
+}
+
+// The image a managed assembly's classes are looked up in. Unity names it
+// after the assembly, so the open is a name lookup; a title whose assembly is
+// named differently from the file (a stripped or merged build) is found by
+// walking the domain instead, because a class lookup that silently answers
+// null is a conversation this bridge cannot finish.
+uint64_t ManagedImage(const char* assembly) {
+  const uint64_t domain_get = GuestExport("il2cpp_domain_get");
+  const uint64_t assembly_open = GuestExport("il2cpp_domain_assembly_open");
+  const uint64_t assembly_image = GuestExport("il2cpp_assembly_get_image");
+  if (!domain_get || !assembly_open || !assembly_image) return 0;
+  const uint64_t no_args[1] = {0};
+  const uint64_t domain = arc_call_guest(domain_get, no_args, 1);
+  if (!domain) return 0;
+  const uint64_t open_args[2] = {domain, reinterpret_cast<uint64_t>(assembly)};
+  uint64_t found = arc_call_guest(assembly_open, open_args, 2);
+  const uint64_t list_assemblies = GuestExport("il2cpp_domain_get_assemblies");
+  const uint64_t image_name = GuestExport("il2cpp_image_get_name");
+  if (found) {
+    const uint64_t image_args[1] = {found};
+    return arc_call_guest(assembly_image, image_args, 1);
+  }
+  if (!list_assemblies || !image_name) return 0;
+  size_t count = 0;
+  const uint64_t list_args[2] = {domain,
+                                 reinterpret_cast<uint64_t>(&count)};
+  const uint64_t list = arc_call_guest(list_assemblies, list_args, 2);
+  if (!list) return 0;
+  const size_t want = strlen(assembly);
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t entry = arc_ld64(list + i * 8);
+    if (!entry) continue;
+    const uint64_t image_args[1] = {entry};
+    const uint64_t image = arc_call_guest(assembly_image, image_args, 1);
+    if (!image) continue;
+    const uint64_t name_args[1] = {image};
+    const char* name =
+        reinterpret_cast<const char*>(arc_call_guest(image_name, name_args, 1));
+    if (!name) continue;
+    if (strncmp(name, assembly, want) != 0) continue;
+    const char after = name[want];
+    if (after == '\0' || after == '.') return image;
   }
   return 0;
 }
@@ -883,7 +1415,9 @@ const char* IdentityOverride(const char* name) {
 
 const char* VersionOverride(const char* name) {
   if (strcmp(name, "appVersion") == 0 || strcmp(name, "clientVersion") == 0 ||
+      strcmp(name, "versionName") == 0 || strcmp(name, "getVersionName") == 0 ||
       strcmp(name, "getVersion") == 0 || strcmp(name, "deviceVersion") == 0 ||
+      strcmp(name, "getBundleVersion") == 0 ||
       strcmp(name, "getApplicationVersion") == 0) {
     static const char* v = getenv("ARC_APP_VERSION");
     return v;
@@ -897,15 +1431,31 @@ const char* DirectoryForName(const char* name) {
   const char* root = arc::ShimAssetRoot();
   if (!root || !*root) return nullptr;
   std::lock_guard<std::mutex> held(lock);
+  // Android hands out Unix paths, and the managed Path class uses Unix rules.
+  // An absolute Windows path here is read as a relative one, so Path.Combine
+  // appends it instead of replacing -- and a caller that combines two of these
+  // answers ends up with the content root twice in the path. The virtual tree
+  // in HostPath is the boundary; every directory answer belongs under it.
   if (strcmp(name, "getBundleDir") == 0 || strcmp(name, "getAssetsPath") == 0 ||
       strcmp(name, "getCocos2dxWritablePath") == 0 ||
       strcmp(name, "appPath") == 0) {
-    bundle = root;
+    bundle = "/androidrecomp/assets";
     return bundle.c_str();
   }
   if (strcmp(name, "getStorageDir") == 0 ||
       strcmp(name, "getCachePath") == 0 ||
-      strcmp(name, "writablePath") == 0) {
+      strcmp(name, "writablePath") == 0 ||
+      strcmp(name, "getFilesDir") == 0 ||
+      strcmp(name, "getDataDir") == 0 ||
+      strcmp(name, "getExternalFilesDir") == 0 ||
+      strcmp(name, "getNoBackupFilesDir") == 0 ||
+      strcmp(name, "getCacheDir") == 0 ||
+      strcmp(name, "getCodeCacheDir") == 0 ||
+      strcmp(name, "getExternalCacheDir") == 0 ||
+      strcmp(name, "getDownloadCacheDir") == 0 ||
+      strcmp(name, "getObbDir") == 0 ||
+      strcmp(name, "getExternalStorageDirectory") == 0 ||
+      strcmp(name, "getExternalStoragePublicDirectory") == 0) {
     // The same directory, not the one above it. Android hands a title one data
     // directory and it both reads its content out of that and writes beside
     // it: Tapped Out builds "<writablePath>/core/res-core/UberShader.vsh" and
@@ -913,14 +1463,32 @@ const char* DirectoryForName(const char* name) {
     // parent put every shipped file one directory out of reach, which shows up
     // not as a missing file but as an empty shader that links to nothing and
     // draws a black screen behind a full set of draw calls.
-    storage = root;
+    storage = "/androidrecomp/storage";
     return storage.c_str();
   }
   return nullptr;
 }
 
-const char* TextForMethod(uint64_t id) {
-  const char* name = MethodName(id);
+// ClassLoader.findLibrary asks Java where a native image lives. Unity reaches
+// for "il2cpp" before it initialises the scripting backend, and an empty answer
+// is not "unknown" to it: it is a library path of length zero, which then goes
+// to dlopen and fails the whole backend. Build the name Android would have
+// under the staged lib directory instead.
+std::string LibraryPathFor(const char* asked) {
+  std::string name = asked ? asked : "";
+  if (name.empty()) return {};
+  const bool prefixed = name.rfind("lib", 0) == 0;
+  const bool suffixed = name.size() >= 3 &&
+                        name.compare(name.size() - 3, 3, ".so") == 0;
+  if (!prefixed) name = "lib" + name;
+  if (!suffixed) name += ".so";
+  const char* root = arc::ShimLibraryRoot();
+  if (root && *root)
+    return (std::filesystem::path(root) / name).generic_string();
+  return name;
+}
+
+const char* TextForMethod(uint64_t id) {  const char* name = MethodName(id);
   if (!name) return nullptr;
   NoteCalled(name);
   // ARC_JNI_<method> answers any string-returning Java method, the same way
@@ -1040,7 +1608,106 @@ const char* NameOf(size_t index) {
 // Every slot takes the context, so it can read its arguments and put a result
 // in the right register. A float return lives in v0, which an
 // integer-returning thunk has no way to express.
+// Tracks which JNI slot is running, so an allocation made on its behalf can
+// say who asked for it. Nesting is real (a slot can call back into guest code
+// that reaches another JNI call), so the previous value is restored.
+struct SlotScope {
+  size_t previous;
+  explicit SlotScope(size_t index) : previous(g_active_slot) {
+    g_active_slot = index;
+  }
+  ~SlotScope() { g_active_slot = previous; }
+};
+
+// Answers a method called on one of our synthetic MotionEvents.
+//
+// The body Unity registers as `nativeInjectEvent` reads the event entirely
+// through JNI, so every one of these questions is on the path between a host
+// mouse and the engine's input state. The return type is a property of the JNI
+// slot, not of the name: a float-returning call has to leave its answer in v0,
+// while everything else goes in x0.
+bool AnswerMotionEvent(Arm64Ctx* c, size_t index) {
+  MotionEventState state;
+  if (!c->x[2] || !MotionEventStateFor(c->x[1], &state)) return false;
+  const char* name = MethodName(c->x[2]);
+  if (!name) return false;
+
+  const bool float_result =
+      (index >= 55 && index <= 57) || (index >= 135 && index <= 137);
+  const auto number = [&](double value) {
+    if (float_result)
+      arc_s_w(c, 0, static_cast<float>(value));
+    else
+      c->x[0] = static_cast<uint64_t>(static_cast<int64_t>(value));
+  };
+
+  // One finger, always index 0. Android reports the full action word here and
+  // leaves masking to getActionMasked, so both are answered from the same
+  // field rather than one being derived from the other.
+  if (strcmp(name, "getAction") == 0) return number(state.action), true;
+  if (strcmp(name, "getActionMasked") == 0)
+    return number(state.action & 0xff), true;
+  if (strcmp(name, "getActionIndex") == 0)
+    return number((state.action >> 8) & 0xff), true;
+  if (strcmp(name, "getPointerCount") == 0) return number(1), true;
+  if (strcmp(name, "getPointerId") == 0) return number(0), true;
+  if (strcmp(name, "getX") == 0 || strcmp(name, "getRawX") == 0)
+    return number(state.x), true;
+  if (strcmp(name, "getY") == 0 || strcmp(name, "getRawY") == 0)
+    return number(state.y), true;
+  if (strcmp(name, "getEventTime") == 0)
+    return number(static_cast<double>(state.event_time)), true;
+  if (strcmp(name, "getDownTime") == 0)
+    return number(static_cast<double>(state.down_time)), true;
+  // InputDevice.SOURCE_TOUCHSCREEN. The engine tests the source to decide
+  // whether an event is a touch at all, so zero here is an event from nowhere.
+  if (strcmp(name, "getSource") == 0) return number(0x1002), true;
+  if (strcmp(name, "getDeviceId") == 0) return number(0), true;
+  if (strcmp(name, "getFlags") == 0 || strcmp(name, "getMetaState") == 0 ||
+      strcmp(name, "getButtonState") == 0 ||
+      strcmp(name, "getEdgeFlags") == 0 ||
+      strcmp(name, "getHistorySize") == 0)
+    return number(0), true;
+  // A finger is the whole contact: full pressure, full size, tool type FINGER.
+  // A zero size or pressure makes some engines discard the sample as noise.
+  if (strcmp(name, "getPressure") == 0 || strcmp(name, "getSize") == 0)
+    return number(1.0), true;
+  // The contact ellipse, in pixels. A mouse has no area, but zero is what a
+  // cancelled or synthetic event reports, and the engine treats it as noise.
+  if (strcmp(name, "getTouchMajor") == 0 ||
+      strcmp(name, "getTouchMinor") == 0)
+    return number(1.0), true;
+  if (strcmp(name, "getToolType") == 0) return number(1), true;
+  if (strcmp(name, "getAxisValue") == 0 ||
+      strcmp(name, "getOrientation") == 0)
+    return number(0.0), true;
+  if (strcmp(name, "getPrecisionX") == 0 ||
+      strcmp(name, "getPrecisionY") == 0)
+    return number(1.0), true;
+  // No history: every event is the current sample, so a historical query
+  // answers with it rather than with nothing.
+  if (strcmp(name, "getHistoricalX") == 0) return number(state.x), true;
+  if (strcmp(name, "getHistoricalY") == 0) return number(state.y), true;
+  if (strcmp(name, "getHistoricalEventTime") == 0)
+    return number(static_cast<double>(state.event_time)), true;
+  if (strcmp(name, "getHistoricalSize") == 0 ||
+      strcmp(name, "getHistoricalPressure") == 0)
+    return number(1.0), true;
+  if (strcmp(name, "isRecycled") == 0) return number(0), true;
+  if (strcmp(name, "recycle") == 0) return c->x[0] = 0, true;
+  if (strcmp(name, "getClass") == 0) {
+    c->x[0] = AllocateText("android/view/MotionEvent");
+    return true;
+  }
+  if (strcmp(name, "toString") == 0) {
+    c->x[0] = AllocateText("MotionEvent");
+    return true;
+  }
+  return false;
+}
+
 void Handle(size_t index, Arm64Ctx* c) {
+  SlotScope slot_scope(index);
   if (index < kSlots) ++g_hits[index];
   ++g_total;
 
@@ -1064,13 +1731,75 @@ void Handle(size_t index, Arm64Ctx* c) {
       // id is the whole content of the event: which Java method the engine
       // reached for, and therefore what it believes it is doing.
       if (index >= 34 && index <= 143) {
-        if (const char* called = MethodName(c->x[2]))
-          fprintf(stderr, "[jni] %s -> %.72s\n", NameOf(index), called);
+        if (const char* called = MethodName(c->x[2])) {
+          const char* owner = MethodOwner(c->x[2]);
+          const char* sig = MethodSignature(c->x[2]);
+          fprintf(stderr, "[jni] %s -> %s%s%s%s lr=%#llx slot=%zu\n", NameOf(index),
+                  owner ? owner : "?", owner ? "." : "", called, sig ? sig : "",
+                  static_cast<unsigned long long>(ARC_X_R(c, 30)), index);
+        }
       }
     }
   }
 
+  // A port's answer, before the built-in table. A call names the class and
+  // method its id was resolved with, so whoever registered an answer has
+  // already said which methods it understands; nothing below this point needs
+  // to know that a title's Java half exists at all.
+  if (index >= 34 && index <= 143 && c->x[2]) {
+    const char* called = MethodName(c->x[2]);
+    if (called) {
+      const char* owner = MethodOwner(c->x[2]);
+      const char* signature = MethodSignature(c->x[2]);
+      if (ArcJavaMethodFn fn = FindJavaMethod(owner, called, signature)) {
+        const std::vector<uint64_t> args = CallArgs(c, index, 8);
+        uint64_t answer = 0;
+        if (fn(owner, called, signature, c->x[1], args.data(), args.size(),
+               &answer)) {
+          c->x[0] = answer;
+          return;
+        }
+      }
+    }
+  }
+
+  // A touch event, answered from the fields the host set when it made it. This
+  // sits before the built-in table because the same method names mean
+  // different things on different receivers -- "getX" on a MotionEvent is a
+  // coordinate, and a table keyed by name alone would answer it for anything.
+  if (index >= 34 && index <= 143 && AnswerMotionEvent(c, index)) return;
+
+  // References. A reference in this environment *is* the object: the arena
+  // never frees and no local frame is ever walked, so a global or local ref is
+  // the same handle. Returning a fresh empty block here loses whatever the
+  // object was -- findLibrary's answer is immediately passed to NewGlobalRef,
+  // and a blank block there turns a library path into the empty string.
+  if (index == 20 || index == 21 || index == 25) {
+    c->x[0] = c->x[1];
+    return;
+  }
+  if (index == 19) {  // PushLocalFrame
+    c->x[0] = 0;
+    return;
+  }
+  if (index == 24) {  // IsSameObject
+    c->x[0] = c->x[1] == c->x[2] ? 1 : 0;
+    return;
+  }
+
   switch (index) {
+    case 31: {  // GetObjectClass(env, object)
+      // A class handle is a name, and the only objects here that have one are
+      // the synthetic touch events. Everything else keeps the old answer -- a
+      // blank block -- because a string handle's text is its contents, not the
+      // class of the string.
+      if (MotionEventStateFor(c->x[1], nullptr)) {
+        c->x[0] = AllocateText("android/view/MotionEvent");
+        return;
+      }
+      c->x[0] = Allocate();
+      return;
+    }
     case 94: {  // GetFieldID(env, class, name, signature)
       c->x[0] = FieldIdFor(reinterpret_cast<const char*>(c->x[2]),
                            reinterpret_cast<const char*>(c->x[3]));
@@ -1113,6 +1842,48 @@ void Handle(size_t index, Arm64Ctx* c) {
       arc_s_w(c, 0, f && f->kind == 'f' ? static_cast<float>(f->real) : 0.0f);
       return;
     }
+    case 163: {  // NewString(env, const jchar* chars, jsize len)
+      // Unity turns a managed string into a jstring through a UTF-16 buffer
+      // and this call, not through NewStringUTF. Left to the default, this
+      // slot handed back a blank block -- so the method name and the signature
+      // Unity passed to Java's reflection helper both arrived empty, and every
+      // Java method it resolved was anonymous. That is why a title handing
+      // Java a binary command looked exactly like a title doing nothing.
+      const auto* units = reinterpret_cast<const uint16_t*>(c->x[1]);
+      const size_t count = static_cast<size_t>(c->x[2]);
+      std::string text;
+      text.reserve(count);
+      for (size_t i = 0; units && i < count; ++i) {
+        uint32_t u = units[i];
+        if (u >= 0xD800 && u < 0xDC00 && i + 1 < count) {
+          const uint32_t low = units[++i];
+          if (low >= 0xDC00 && low < 0xE000)
+            u = 0x10000 + ((u - 0xD800) << 10) + (low - 0xDC00);
+        }
+        if (u < 0x80) {
+          text.push_back(static_cast<char>(u));
+        } else if (u < 0x800) {
+          text.push_back(static_cast<char>(0xC0 | (u >> 6)));
+          text.push_back(static_cast<char>(0x80 | (u & 0x3F)));
+        } else if (u < 0x10000) {
+          text.push_back(static_cast<char>(0xE0 | (u >> 12)));
+          text.push_back(static_cast<char>(0x80 | ((u >> 6) & 0x3F)));
+          text.push_back(static_cast<char>(0x80 | (u & 0x3F)));
+        } else {
+          text.push_back(static_cast<char>(0xF0 | (u >> 18)));
+          text.push_back(static_cast<char>(0x80 | ((u >> 12) & 0x3F)));
+          text.push_back(static_cast<char>(0x80 | ((u >> 6) & 0x3F)));
+          text.push_back(static_cast<char>(0x80 | (u & 0x3F)));
+        }
+      }
+      const uint64_t made = AllocateText(text.c_str());
+      if (getenv("ARC_TRACE_JNI"))
+        fprintf(stderr, "[jni] NewString(%zu) -> %#llx text=\"%.60s\"\n", count,
+                static_cast<unsigned long long>(made),
+                reinterpret_cast<const char*>(made));
+      c->x[0] = made;
+      return;
+    }
     case 167: {  // NewStringUTF(env, const char*)
       // The guest's own bytes becoming a jstring, and the only place that text
       // ever enters the Java side. Without this the slot fell to the default,
@@ -1120,7 +1891,17 @@ void Handle(size_t index, Arm64Ctx* c) {
       // Java arrived empty. It reads as working, because an empty string is a
       // legal string: the preference lookup that decides where the game's
       // server lives was being asked for the key "", and answered nothing.
-      c->x[0] = AllocateText(reinterpret_cast<const char*>(c->x[1]));
+      const uint64_t made =
+          AllocateText(reinterpret_cast<const char*>(c->x[1]));
+      if (c->x[1]) {
+        std::lock_guard<std::mutex> held(g_asset_text_lock);
+        g_last_utf8 = reinterpret_cast<const char*>(c->x[1]);
+      }
+      if (getenv("ARC_TRACE_JNI"))
+        fprintf(stderr, "[jni] NewStringUTF -> %#llx text=\"%.60s\"\n",
+                static_cast<unsigned long long>(made),
+                reinterpret_cast<const char*>(made));
+      c->x[0] = made;
       return;
     }
     case 164:    // GetStringLength
@@ -1157,17 +1938,69 @@ void Handle(size_t index, Arm64Ctx* c) {
       static const bool trace = getenv("ARC_TRACE_JNI") != nullptr;
       if (trace) {
         const char* s = reinterpret_cast<const char*>(c->x[1]);
-        fprintf(stderr, "[jni] GetStringUTFChars %#llx %s \"%.48s\"\n",
+        fprintf(stderr, "[jni] GetStringUTFChars %#llx %s \"%.48s\" lr=%#llx\n",
                 static_cast<unsigned long long>(c->x[1]),
-                arc_jni_owns(c->x[1]) ? "ours" : "not ours", s ? s : "");
+                arc_jni_owns(c->x[1]) ? "ours" : "not ours", s ? s : "",
+                static_cast<unsigned long long>(ARC_X_R(c, 30)));
+      }
+      const char* s = reinterpret_cast<const char*>(c->x[1]);
+      // An opaque handle has no bytes of its own. The boot.config Scanner
+      // reads through one, and the file's text is the answer it needs. A
+      // handle made by AllocateText is different even when the string is
+      // empty: that empty string is the answer, and substituting the last
+      // asset read for it is how the whole boot config once became the
+      // culture name.
+      bool has_text = false;
+      if (arc_jni_owns(c->x[1])) {
+        has_text = *reinterpret_cast<const uint64_t*>(
+                       c->x[1] + kBlock - sizeof(uint64_t)) ==
+                   kTextHandleMagic;
+      }
+      if (!has_text && (!s || !*s)) {
+        std::lock_guard<std::mutex> held(g_asset_text_lock);
+        if (!g_last_asset_text.empty()) {
+          c->x[0] = reinterpret_cast<uint64_t>(g_last_asset_text.c_str());
+          if (c->x[2]) *reinterpret_cast<uint8_t*>(c->x[2]) = 0;
+          return;
+        }
       }
       c->x[0] = c->x[1];
       if (c->x[2]) *reinterpret_cast<uint8_t*>(c->x[2]) = 0;  // isCopy = false
       return;
     }
+    case 6: {  // FindClass(env, const char* name)
+      // The class handle used to be an anonymous block. That made the bridge
+      // unable to tell one class from another, so every method was resolved by
+      // name alone and a call through it had no owner to report. Carrying the
+      // name is what lets a Java method be answered per class -- which is the
+      // only way a binary protocol like NPF's can be implemented from this
+      // side at all.
+      c->x[0] = AllocateText(reinterpret_cast<const char*>(c->x[1]));
+      return;
+    }
+
+    case 7:    // FromReflectedMethod(env, jobject method)
+    case 8:    // FromReflectedField(env, jobject field) -- the object is the id
+    case 9:    // ToReflectedMethod(env, jclass, jmethodID, jboolean)
+    case 12: {  // ToReflectedField
+      // Unity keeps a Java `Method` object where a jmethodID goes and converts
+      // between the two views with these calls. There is no Java here, so the
+      // two views *are* the same value: the id `getMethodID` answered with.
+      // Treating the reflection object as opaque was what made every resolved
+      // method anonymous -- the conversion turned a real name into a blank.
+      // The object-to-id direction carries the object in x1; the id-to-object
+      // direction carries the id in x2, behind the class.
+      c->x[0] = (index == 7 || index == 8) ? c->x[1] : c->x[2];
+      return;
+    }
+
     case 33:     // GetMethodID(env, class, name, signature)
     case 113: {  // GetStaticMethodID
       const char* name = reinterpret_cast<const char*>(c->x[2]);
+      const char* signature = reinterpret_cast<const char*>(c->x[3]);
+      const char* owner = arc_jni_owns(c->x[1])
+                              ? reinterpret_cast<const char*>(c->x[1])
+                              : nullptr;
       // "This method is not there." Every method id this bridge hands out is
       // a stand-in, so a title that looks one up always finds it -- and a
       // title that asks Java for something optional is written to cope with
@@ -1183,17 +2016,41 @@ void Handle(size_t index, Arm64Ctx* c) {
         c->x[0] = 0;
         return;
       }
-      c->x[0] = MethodIdFor(name);
+      c->x[0] = MethodIdFor(owner, name, signature);
       return;
     }
 
     // Constructing a Java object. The one that matters is the SDK's callback
     // wrapper, whose whole content is the id it was constructed with -- so
     // the handle is given that id as its text and can be recognised later.
+    //
+    // A request object is the other case: it is constructed with the id of the
+    // conversation it belongs to and would read it back in Java, which is not
+    // here. That first argument is remembered beside the handle, so the answer
+    // to its `execute` can name the same conversation.
     case 28:     // NewObject
     case 29:     // NewObjectV
     case 30: {   // NewObjectA
       uint64_t made = Allocate();
+      uint64_t first = 0;
+      bool has_first = false;
+      if (index == 30) {
+        if (c->x[3]) {
+          memcpy(&first, reinterpret_cast<const void*>(c->x[3]), sizeof first);
+          has_first = true;
+        }
+      } else if (index == 29) {
+        if (c->x[3]) {
+          std::vector<unsigned char> cursor(arc::ShimVaListSize());
+          memcpy(cursor.data(), reinterpret_cast<const void*>(c->x[3]),
+                 cursor.size());
+          first = arc::ShimVaNextInt(cursor.data());
+          has_first = true;
+        }
+      } else {
+        first = c->x[3];
+        has_first = true;
+      }
       if (index == 29 && c->x[3]) {
         std::vector<unsigned char> cursor(arc::ShimVaListSize());
         memcpy(cursor.data(), reinterpret_cast<const void*>(c->x[3]),
@@ -1210,6 +2067,16 @@ void Handle(size_t index, Arm64Ctx* c) {
             break;
           }
         }
+      }
+      NoteCtorText(made, c->x[1], first, has_first);
+      if (getenv("ARC_TRACE_CTOR")) {
+        const char* cls = HandleText(c->x[1]);
+        const char* arg = HandleText(first);
+        fprintf(stderr,
+                "[jni] NewObject idx=%zu cls=%s first=%#llx \"%s\" -> %#llx\n",
+                index, cls ? cls : "(none)",
+                static_cast<unsigned long long>(first), arg ? arg : "(none)",
+                static_cast<unsigned long long>(made));
       }
       c->x[0] = made;
       return;
@@ -1232,6 +2099,270 @@ void Handle(size_t index, Arm64Ctx* c) {
       // way instead, and answering it with a blank handle made every path the
       // engine asked for come back empty.
       const char* name = MethodName(c->x[2]);
+      // Unity takes ownership of a touch with `MotionEvent.obtain(event)` and
+      // then reads the *copy*: the source first, to decide whether it is a
+      // touch at all, and the rest of the fields afterwards. Answering the
+      // copy with a blank object makes every event look like it came from
+      // nowhere, and the tap is dropped before any coordinate is asked for.
+      if (name && strcmp(name, "obtain") == 0) {
+        MotionEventState state;
+        const std::vector<uint64_t> args = CallArgs(c, index, 1);
+        if (!args.empty() && MotionEventStateFor(args[0], &state)) {
+          c->x[0] = arc_jni_motion_event(state.action, state.x, state.y,
+                                         state.down_time, state.event_time);
+          return;
+        }
+      }
+      // The platform trust store, asked for in the vocabulary Java uses.
+      // See EnsureTrustStore above: this is the answer a TLS handshake needs,
+      // and without it the verifier trusts nothing.
+      if (name && strcmp(name, "getTrustManagers") == 0) {
+        NoteCalled(name);
+        EnsureTrustStore();
+        const uint64_t managers[1] = {g_trust_manager};
+        c->x[0] = AllocateObjectArray(managers, 1);
+        return;
+      }
+      if (name && strcmp(name, "getAcceptedIssuers") == 0) {
+        NoteCalled(name);
+        EnsureTrustStore();
+        c->x[0] = g_trust_issuers;
+        return;
+      }
+      if (name && strcmp(name, "getEncoded") == 0) {
+        // Only for the certificates this store handed out. getEncoded() is a
+        // general question, and answering it with a CA for some other object
+        // would be a different kind of wrong.
+        EnsureTrustStore();
+        for (size_t i = 0; i < g_trust_cert_handles.size(); ++i) {
+          if (g_trust_cert_handles[i] != c->x[1]) continue;
+          NoteCalled(name);
+          const std::vector<unsigned char>& der = g_trust_certs[i];
+          const uint64_t array = AllocateByteArray(der.size());
+          if (array && !der.empty())
+            memcpy(reinterpret_cast<void*>(array), der.data(), der.size());
+          c->x[0] = array;
+          return;
+        }
+      }
+      if (name && strcmp(name, "getDefaultAlgorithm") == 0) {
+        NoteCalled(name);
+        c->x[0] = AllocateText("X509");
+        return;
+      }
+      // Unity does not resolve Java method ids itself. It hands the class,
+      // the name and the signature to `ReflectionHelper.getMethodID` in Java
+      // and keeps the `java.lang.reflect.Method` that comes back, turning it
+      // into an id later with `FromReflectedMethod`. Java is not here, so this
+      // one call decides the identity of every later Java call -- and
+      // answering it with a blank object made all of them anonymous. A title
+      // handing Java a binary command then looked exactly like one calling a
+      // method with no name at all, which is indistinguishable from a title
+      // that does nothing.
+      if (name && (strcmp(name, "getMethodID") == 0 ||
+                   strcmp(name, "getConstructorID") == 0)) {
+        const bool ctor = strcmp(name, "getConstructorID") == 0;
+        const std::vector<uint64_t> args = CallArgs(c, index, ctor ? 2 : 4);
+        const char* cls = args.size() > 0 ? HandleText(args[0]) : nullptr;
+        const char* member = ctor ? "<init>"
+                                  : args.size() > 1 ? HandleText(args[1]) : nullptr;
+        const char* signature =
+            args.size() > (ctor ? 1u : 2u) ? HandleText(args[ctor ? 1 : 2])
+                                           : nullptr;
+        if (getenv("ARC_TRACE_JNI")) {
+          uint64_t jv[4] = {};
+          if (c->x[3]) memcpy(jv, reinterpret_cast<const void*>(c->x[3]), sizeof jv);
+          fprintf(stderr,
+                  "[jni] %s raw slot=%zu x1=%#llx x2=%#llx x3=%#llx "
+                  "jv0=%#llx jv1=%#llx jv2=%#llx jv3=%#llx -> cls=%.48s "
+                  "member=%.48s sig=%.48s\n",
+                  name, index, static_cast<unsigned long long>(c->x[1]),
+                  static_cast<unsigned long long>(c->x[2]),
+                  static_cast<unsigned long long>(c->x[3]),
+                  static_cast<unsigned long long>(jv[0]),
+                  static_cast<unsigned long long>(jv[1]),
+                  static_cast<unsigned long long>(jv[2]),
+                  static_cast<unsigned long long>(jv[3]), cls ? cls : "(none)",
+                  member ? member : "(none)", signature ? signature : "(none)");
+        }
+        c->x[0] = MethodIdFor(cls, member, signature);
+        return;
+      }
+      // The boot config is the one file Java reads before Unity starts native
+      // code. Return its text from open, keep it for the Scanner that follows,
+      // and make the Scanner calls operate on that text rather than on an
+      // opaque handle with no bytes behind it.
+      if (name && strcmp(name, "open") == 0) {
+        uint64_t arg = 0;
+        std::string text;
+        if (getenv("ARC_TRACE_JNI")) {
+          struct VaProbe {
+            uint64_t stack, gr_top, vr_top;
+            int32_t gr_offs, vr_offs;
+          } va = {};
+          if (c->x[3]) memcpy(&va, reinterpret_cast<const void*>(c->x[3]), sizeof va);
+          fprintf(stderr,
+                  "[jni] open raw x1=%#llx x3=%#llx x4=%#llx x5=%#llx "
+                  "va={%#llx,%#llx,%#llx,%d,%d}\n",
+                  static_cast<unsigned long long>(c->x[1]),
+                  static_cast<unsigned long long>(c->x[3]),
+                  static_cast<unsigned long long>(c->x[4]),
+                  static_cast<unsigned long long>(c->x[5]),
+                  static_cast<unsigned long long>(va.stack),
+                  static_cast<unsigned long long>(va.gr_top),
+                  static_cast<unsigned long long>(va.vr_top), va.gr_offs,
+                  va.vr_offs);
+          const uint64_t* regs =
+              reinterpret_cast<const uint64_t*>(va.gr_top + va.gr_offs);
+          if (regs)
+            fprintf(stderr,
+                    "[jni] open regs %#llx %#llx %#llx %#llx %#llx %#llx\n",
+                    static_cast<unsigned long long>(regs[0]),
+                    static_cast<unsigned long long>(regs[1]),
+                    static_cast<unsigned long long>(regs[2]),
+                    static_cast<unsigned long long>(regs[3]),
+                    static_cast<unsigned long long>(regs[4]),
+                    static_cast<unsigned long long>(regs[5]));
+          const uint64_t* around =
+              reinterpret_cast<const uint64_t*>(va.gr_top - 80);
+          if (around)
+            fprintf(stderr,
+                    "[jni] open around %#llx %#llx %#llx %#llx %#llx "
+                    "%#llx %#llx %#llx %#llx %#llx\n",
+                    static_cast<unsigned long long>(around[0]),
+                    static_cast<unsigned long long>(around[1]),
+                    static_cast<unsigned long long>(around[2]),
+                    static_cast<unsigned long long>(around[3]),
+                    static_cast<unsigned long long>(around[4]),
+                    static_cast<unsigned long long>(around[5]),
+                    static_cast<unsigned long long>(around[6]),
+                    static_cast<unsigned long long>(around[7]),
+                    static_cast<unsigned long long>(around[8]),
+                    static_cast<unsigned long long>(around[9]));
+          const uint64_t* stack = reinterpret_cast<const uint64_t*>(va.stack);
+          if (stack)
+            fprintf(stderr,
+                    "[jni] open stack %#llx %#llx %#llx %#llx %#llx %#llx\n",
+                    static_cast<unsigned long long>(stack[0]),
+                    static_cast<unsigned long long>(stack[1]),
+                    static_cast<unsigned long long>(stack[2]),
+                    static_cast<unsigned long long>(stack[3]),
+                    static_cast<unsigned long long>(stack[4]),
+                    static_cast<unsigned long long>(stack[5]));
+        }
+        std::vector<uint64_t> candidates = OwnedArgs(c);
+        if (arc_jni_owns(c->x[3])) candidates.push_back(c->x[3]);
+        for (uint64_t candidate : candidates) {
+          const std::string found =
+              ReadAssetFile(reinterpret_cast<const char*>(candidate));
+          if (getenv("ARC_TRACE_JNI"))
+            fprintf(stderr, "[jni] open arg %#llx \"%.60s\" %s\n",
+                    static_cast<unsigned long long>(candidate),
+                    reinterpret_cast<const char*>(candidate),
+                    found.empty() ? "no file" : "found");
+          if (!found.empty()) {
+            arg = candidate;
+            text = found;
+            break;
+          }
+        }
+        // The argument slot the engine uses for open() is not always the
+        // string it just built: the JNI bridge can pass a class handle in the
+        // first vararg position. The last NewStringUTF is the asset name in
+        // that path, and boot.config is the only file read this early.
+        if (text.empty()) {
+          std::lock_guard<std::mutex> held(g_asset_text_lock);
+          if (!g_last_utf8.empty()) {
+            text = ReadAssetFile(g_last_utf8.c_str());
+            if (!text.empty()) arg = AllocateText(g_last_utf8.c_str());
+          }
+        }
+        if (text.empty()) {
+          text = ReadAssetFile("bin/Data/boot.config");
+          if (!text.empty()) arg = AllocateText("bin/Data/boot.config");
+        }
+        if (!arg) {
+          arg = FirstOwnedArg(c);
+          if (!arg && arc_jni_owns(c->x[3])) arg = c->x[3];
+        }
+        if (!text.empty()) {
+          NoteCalled(name);
+          {
+            std::lock_guard<std::mutex> held(g_asset_text_lock);
+            g_last_asset_text = text;
+          }
+          if (getenv("ARC_TRACE_JNI"))
+            fprintf(stderr, "[jni] open %s -> %zu bytes\n",
+                    reinterpret_cast<const char*>(arg), text.size());
+          c->x[0] = AllocateText(text.c_str());
+          return;
+        }
+        if (getenv("ARC_TRACE_JNI"))
+          fprintf(stderr, "[jni] open MISS arg=%#llx text=\"%.60s\"\n",
+                  static_cast<unsigned long long>(arg),
+                  arg ? reinterpret_cast<const char*>(arg) : "");
+      }
+      if (name && strcmp(name, "useDelimiter") == 0) {
+        NoteCalled(name);
+        c->x[0] = c->x[1];
+        return;
+      }
+      if (name && (strcmp(name, "next") == 0 ||
+                   strcmp(name, "nextLine") == 0)) {
+        NoteCalled(name);
+        std::lock_guard<std::mutex> held(g_asset_text_lock);
+        const uint64_t made = AllocateText(g_last_asset_text.c_str());
+        if (getenv("ARC_TRACE_JNI"))
+          fprintf(stderr, "[jni] next -> %#llx (%zu bytes) text=\"%.60s\"\n",
+                  static_cast<unsigned long long>(made), g_last_asset_text.size(),
+                  reinterpret_cast<const char*>(made));
+        c->x[0] = made;
+        return;
+      }
+      // ClassLoader.findLibrary is how Unity turns a backend name into the
+      // shared object it will dlopen. The answer has to be non-empty and has
+      // to name a file that exists; see LibraryPathFor.
+      if (name && strcmp(name, "findLibrary") == 0) {
+        NoteCalled(name);
+        const uint64_t which = FirstOwnedArg(c);
+        std::string requested =
+            which ? reinterpret_cast<const char*>(which) : std::string();
+        // The va_list walk is not reliable for this bridge: some calls put the
+        // name in a register that the generic vararg reader cannot see. The
+        // name was just made with NewStringUTF, so that is the fallback.
+        if (requested.empty()) {
+          std::lock_guard<std::mutex> held(g_asset_text_lock);
+          requested = g_last_utf8;
+        }
+        static const bool trace = getenv("ARC_TRACE_JNI") != nullptr;
+        if (trace)
+          fprintf(stderr, "[jni] findLibrary \"%s\"\n", requested.c_str());
+        const std::string path = LibraryPathFor(requested.c_str());
+        if (trace) {
+          fprintf(stderr, "[jni] findLibrary path \"%s\" (%zu) lr=%#llx\n",
+                  path.c_str(), path.size(),
+                  static_cast<unsigned long long>(ARC_X_R(c, 30)));
+          fprintf(stderr, "[jni] findLibrary frames:");
+          const size_t n = arc_frame_count();
+          for (size_t i = 0; i < n && i < 12; ++i) {
+            const uint64_t frame = arc_frame_at(i);
+            fprintf(stderr, " %u:%llx", static_cast<unsigned>(frame >> 56),
+                    static_cast<unsigned long long>(
+                        frame & 0x00FFFFFFFFFFFFFFull));
+          }
+          fprintf(stderr, "\n");
+        }
+        if (!path.empty()) {
+          const uint64_t made = AllocateText(path.c_str());
+          if (trace)
+            fprintf(stderr, "[jni] findLibrary made %#llx text \"%.60s\"\n",
+                    static_cast<unsigned long long>(made),
+                    reinterpret_cast<const char*>(made));
+          g_trace_next_alloc = true;
+          c->x[0] = made;
+          return;
+        }
+      }
       // getComponentId is the same question in a different vocabulary: the
       // Nimble bridge hands Java an object per registered component and asks
       // it back which component that was. A handle we made carries its own
@@ -1304,6 +2435,23 @@ void Handle(size_t index, Arm64Ctx* c) {
           return;
         }
       }
+      // A File in this environment *is* its path text: every directory the
+      // engine asks Java for is a handle carrying a Unix path, and a File built
+      // from one is the same text again. Asking such an object to repeat itself
+      // -- its absolute or canonical path -- has one right answer, and the
+      // table's blank is not it. That blank is what made Unity's
+      // persistentDataPath the empty string, so every cache root Nabe built
+      // from it collapsed to "/" and the SDK looked for its own packs at the
+      // root of the drive.
+      if (name && (strcmp(name, "getAbsolutePath") == 0 ||
+                   strcmp(name, "getPath") == 0 ||
+                   strcmp(name, "getCanonicalPath") == 0)) {
+        if (HandleText(c->x[1])) {
+          NoteCalled(name);
+          c->x[0] = c->x[1];
+          return;
+        }
+      }
       const char* text = TextForMethod(c->x[2]);
       c->x[0] = text ? AllocateText(text) : Allocate();
       return;
@@ -1328,6 +2476,12 @@ void Handle(size_t index, Arm64Ctx* c) {
       // its ordinal, and reading it back is what keeps "which constant" and
       // "what number" the same answer.
       const char* name = MethodName(c->x[2]);
+      if (name && (strcmp(name, "hasNext") == 0 ||
+                   strcmp(name, "hasNextLine") == 0)) {
+        NoteCalled(name);
+        c->x[0] = 1;
+        return;
+      }
       if (name && strcmp(name, "ordinal") == 0) {
         NoteCalled(name);
         const char* self = reinterpret_cast<const char*>(c->x[1]);
@@ -1337,6 +2491,35 @@ void Handle(size_t index, Arm64Ctx* c) {
       }
       bool answered = false;
       c->x[0] = static_cast<uint64_t>(NumberForMethod(c->x[2], &answered));
+      return;
+    }
+
+    // A method returning a float or a double. These have to write the
+    // floating-point register, not just x0: a JNI float return lives in s0,
+    // and the generic fallback only filled x0, so the guest read whatever the
+    // previous guest computation left in s0. getRefreshRate is the one that
+    // matters -- the engine divides by it to turn a frame interval into ticks
+    // -- and a stale value there (the host's uptime, ~1.8e12) saturated the
+    // frame clock and left the game spinning in its first heavy frame. 60 Hz
+    // is the Android baseline and what the engine expects when the host has
+    // no display to ask.
+    case 55: case 56: case 57:       // CallFloatMethod{,V,A}
+    case 135: case 136: case 137: {  // CallStaticFloatMethod{,V,A}
+      const char* name = MethodName(c->x[2]);
+      if (name) NoteCalled(name);
+      const bool refresh = name && strcmp(name, "getRefreshRate") == 0;
+      if (refresh && getenv("ARC_TRACE_REFRESH"))
+        fprintf(stderr, "[refresh] getRefreshRate -> 60\n");
+      c->q[0].f32[0] = refresh ? 60.0f : 0.0f;
+      c->x[0] = 0;
+      return;
+    }
+    case 58: case 59: case 60:       // CallDoubleMethod{,V,A}
+    case 138: case 139: case 140: {  // CallStaticDoubleMethod{,V,A}
+      const char* name = MethodName(c->x[2]);
+      if (name) NoteCalled(name);
+      c->q[0].f64[0] = 0.0;
+      c->x[0] = 0;
       return;
     }
 
@@ -1353,6 +2536,19 @@ void Handle(size_t index, Arm64Ctx* c) {
     case 143: {  // CallStaticVoidMethodA
       const char* name = MethodName(c->x[2]);
       if (name) NoteCalled(name);
+      // What a title hands Java is the whole question when Java is not here:
+      // the call names a method, and the arguments say what it was asked to
+      // do. Printing the text ones costs little and turns "it called execute"
+      // into the actual command.
+      if (getenv("ARC_TRACE_JNI")) {
+        const std::vector<uint64_t> shown = CallArgs(c, index, 4);
+        for (size_t i = 0; i < shown.size(); ++i) {
+          const char* text = HandleText(shown[i]);
+          if (!text) continue;
+          fprintf(stderr, "[jni]   %s arg%zu (%zu) \"%.600s\"\n",
+                  name ? name : "?", i, strlen(text), text);
+        }
+      }
       // Only the va_list forms carry arguments we can walk; the varargs forms
       // spread theirs across registers we were not handed.
       const bool va = index == 62 || index == 142;
@@ -1457,13 +2653,29 @@ void Handle(size_t index, Arm64Ctx* c) {
       return;
     }
 
+    case 32: {  // IsInstanceOf(env, jobject obj, jclass clazz)
+      // The only hierarchy this bridge can answer is the one it built: a
+      // handle that carries its class name is an instance of the class of the
+      // same name. A block we handed back for a question we did not
+      // understand carries nothing, and calling it an instance of anything
+      // would be a guess -- which is what a verifier cannot afford.
+      const char* object = HandleText(c->x[1]);
+      const char* klass = HandleText(c->x[2]);
+      c->x[0] = (object && klass && strcmp(object, klass) == 0) ? 1 : 0;
+      return;
+    }
+
     case 171: {  // GetArrayLength
-      // An array of objects knows its own count. Everything else here is a
-      // byte array, which is the same NUL-terminated text a string handle
-      // holds, so its length is simply that -- and an array we did not fill
-      // is a zeroed block, which measures zero, which is the truth about it.
+      // An array of objects knows its own count. A byte array knows its own
+      // length. Anything else is text, which is the same NUL-terminated bytes
+      // a string handle holds -- and an array we did not fill is a zeroed
+      // block, which measures zero, which is the truth about it.
       if (IsObjectArray(c->x[1])) {
         c->x[0] = ArrayCount(c->x[1]);
+        return;
+      }
+      if (IsByteArray(c->x[1])) {
+        c->x[0] = ByteArrayLength(c->x[1]);
         return;
       }
       const char* s = reinterpret_cast<const char*>(c->x[1]);
@@ -1489,18 +2701,48 @@ void Handle(size_t index, Arm64Ctx* c) {
       if (c->x[2]) *reinterpret_cast<uint8_t*>(c->x[2]) = 0;  // isCopy = false
       return;
     }
+    case 176: {  // NewByteArray(env, jsize len)
+      c->x[0] = AllocateByteArray(c->x[1]);
+      return;
+    }
     case 208: {  // SetByteArrayRegion(env, array, start, len, buf)
       // The engine builds a Java string by filling a byte array and handing it
       // to a helper. Dropping this leaves the array empty, the string empty,
-      // and the engine's own log a column of blank lines.
-      auto* dst = reinterpret_cast<char*>(c->x[1]);
+      // and the engine's own log a column of blank lines. The same call is how
+      // a title hands Java a binary payload, so the copy has to be exact --
+      // including the zero bytes -- and the length has to grow with it.
       const auto* src = reinterpret_cast<const char*>(c->x[4]);
       const uint64_t start = c->x[2], len = c->x[3];
-      if (dst && src && arc_jni_owns(c->x[1]) && start + len < kBlock) {
-        memcpy(dst + start, src, static_cast<size_t>(len));
-        // NUL-terminated, because everything downstream reads it as text.
-        dst[start + len] = '\0';
+      static const char* dump = getenv("ARC_TRACE_JNI_BYTES");
+      static unsigned long long dumped;
+      const unsigned long long cap = dump ? strtoull(dump, nullptr, 0) : 0;
+      if (dump && src && len && dumped < cap) {
+        const unsigned long long room = cap - dumped;
+        const unsigned long long show = len < room ? len : room;
+        fprintf(stderr, "[jni] bytes array=%#llx start=%llu len=%llu:",
+                static_cast<unsigned long long>(c->x[1]),
+                static_cast<unsigned long long>(start),
+                static_cast<unsigned long long>(len));
+        for (uint64_t i = 0; i < show && i < 256; ++i)
+          fprintf(stderr, " %02x", static_cast<unsigned char>(src[i]));
+        fputc('\n', stderr);
+        dumped += show;
       }
+      if (!arc_jni_owns(c->x[1])) return;
+      const size_t room = IsByteArray(c->x[1])
+                              ? kBytesCapacity + 1
+                              : kBlock - 2 * sizeof(uint64_t);
+      const uint64_t copy = start < room
+                                ? (len < room - start ? len : room - start)
+                                : 0;
+      auto* dst = reinterpret_cast<char*>(c->x[1]) + start;
+      if (src && copy) memcpy(dst, src, static_cast<size_t>(copy));
+      // NUL-terminated when there is room, because a byte array of text is
+      // also read as one by the engine's own helpers.
+      if (start + copy < room) dst[copy] = '\0';
+      if (IsByteArray(c->x[1]) &&
+          start + copy > ByteArrayLength(c->x[1]))
+        SetByteArrayLength(c->x[1], start + copy);
       return;
     }
 
@@ -1508,6 +2750,36 @@ void Handle(size_t index, Arm64Ctx* c) {
     case 192:    // ReleaseByteArrayElements
     case 223:    // ReleasePrimitiveArrayCritical
       return;    // nothing was copied, so there is nothing to write back
+
+    case 215: {  // RegisterNatives(env, clazz, methods, count)
+      // `methods` points at the guest's own array, in the mapped image, so it
+      // is readable here. Copy the names rather than keeping pointers into an
+      // image that a later unload could take away.
+      struct GuestNativeMethod {
+        const char* name;
+        const char* signature;
+        void* fn;
+      };
+      const auto* methods =
+          reinterpret_cast<const GuestNativeMethod*>(c->x[2]);
+      const int count = static_cast<int>(c->x[3]);
+      if (methods && count > 0) {
+        std::lock_guard<std::mutex> g(g_natives_lock);
+        for (int i = 0; i < count; ++i) {
+          if (getenv("ARC_TRACE_JNI"))
+            fprintf(stderr, "[jni] RegisterNatives %s %s -> %#llx\n",
+                    methods[i].name ? methods[i].name : "?",
+                    methods[i].signature ? methods[i].signature : "?",
+                    static_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(methods[i].fn)));
+          g_natives.push_back({methods[i].name ? methods[i].name : "",
+                               methods[i].signature ? methods[i].signature : "",
+                               reinterpret_cast<uint64_t>(methods[i].fn)});
+        }
+      }
+      c->x[0] = 0;  // JNI_OK
+      return;
+    }
 
     case 219: {  // GetJavaVM(env, JavaVM** out)
       // Writing the VM out is the whole point of the call. Left unwritten, the
@@ -1604,6 +2876,106 @@ uint64_t arc_jni_object(void) { return Allocate(); }
 // A jstring, which here is just its own text: every path that reads one --
 // GetStringUTFChars, getBytes, toString -- hands the handle straight back.
 uint64_t arc_jni_string(const char* text) { return AllocateText(text); }
+
+uint64_t arc_jni_motion_event(int action, float x, float y, int64_t down_time,
+                              int64_t event_time) {
+  const uint64_t handle = AllocateText("android/view/MotionEvent");
+  if (!handle) return 0;
+  std::lock_guard<std::mutex> held(g_motion_lock);
+  MotionEventState& state = g_motion_events[handle];
+  state.action = action;
+  state.x = x;
+  state.y = y;
+  state.down_time = down_time;
+  state.event_time = event_time;
+  return handle;
+}
+
+const char* arc_jni_text(uint64_t handle) { return HandleText(handle); }
+
+const char* arc_jni_ctor_text(uint64_t handle) { return CtorTextFor(handle); }
+
+const char* arc_jni_ctor_class(uint64_t handle) { return CtorClassFor(handle); }
+
+// The bytes behind one of the environment's handles, or null if the handle is
+// not a byte array. A title that speaks a binary protocol to its Java half
+// hands the payload over as `byte[]`, and there is nothing textual to read.
+const uint8_t* arc_jni_bytes(uint64_t handle, size_t* length) {
+  if (!IsByteArray(handle)) return nullptr;
+  if (length) *length = static_cast<size_t>(ByteArrayLength(handle));
+  return reinterpret_cast<const uint8_t*>(handle);
+}
+
+void arc_jni_register_method(const char* owner, const char* name,
+                             const char* signature, ArcJavaMethodFn fn) {
+  if (!name || !fn) return;
+  std::lock_guard<std::mutex> held(g_java_method_lock);
+  g_java_methods.push_back(
+      {owner ? owner : "", name, signature ? signature : "", fn});
+}
+
+uint64_t arc_guest_string(const char* utf8) { return GuestStringFor(utf8); }
+
+int arc_call_managed(const char* assembly, const char* name_space,
+                     const char* klass, const char* method, size_t argc,
+                     const char* const* utf8_args) {
+  if (!assembly || !klass || !method) return -1;
+  if (argc > 8) return -1;
+  const uint64_t class_from_name = GuestExport("il2cpp_class_from_name");
+  const uint64_t method_from_name =
+      GuestExport("il2cpp_class_get_method_from_name");
+  const uint64_t invoke = GuestExport("il2cpp_runtime_invoke");
+  if (!class_from_name || !method_from_name || !invoke) return -1;
+  const uint64_t image = ManagedImage(assembly);
+  if (!image) return -2;
+  const uint64_t class_args[3] = {image,
+                                  reinterpret_cast<uint64_t>(name_space),
+                                  reinterpret_cast<uint64_t>(klass)};
+  const uint64_t found_class = arc_call_guest(class_from_name, class_args, 3);
+  if (!found_class) return -3;
+  const uint64_t method_args[3] = {found_class,
+                                   reinterpret_cast<uint64_t>(method),
+                                   static_cast<uint64_t>(argc)};
+  const uint64_t found_method =
+      arc_call_guest(method_from_name, method_args, 3);
+  if (!found_method) return -4;
+  uint64_t strings[8] = {};
+  for (size_t i = 0; i < argc; ++i) {
+    strings[i] = GuestStringFor(utf8_args && utf8_args[i] ? utf8_args[i] : "");
+    if (!strings[i]) return -5;
+  }
+  // The invoke reports a managed exception through the last argument rather
+  // than by unwinding into host code, which is the only shape a managed
+  // fault may take across this boundary.
+  uint64_t exception = 0;
+  const uint64_t invoke_args[4] = {found_method, 0,
+                                   reinterpret_cast<uint64_t>(strings),
+                                   reinterpret_cast<uint64_t>(&exception)};
+  arc_call_guest(invoke, invoke_args, 4);
+  return exception ? 1 : 0;
+}
+
+uint64_t arc_jni_lookup_native(const char* name, const char* signature) {
+  if (!name) return 0;
+  std::lock_guard<std::mutex> g(g_natives_lock);
+  for (const RegisteredNative& n : g_natives)
+    if (n.name == name && (!signature || n.signature == signature))
+      return n.fn;
+  return 0;
+}
+
+size_t arc_jni_native_count(void) {
+  std::lock_guard<std::mutex> g(g_natives_lock);
+  return g_natives.size();
+}
+
+void arc_jni_dump_natives(void) {
+  std::lock_guard<std::mutex> g(g_natives_lock);
+  for (const RegisteredNative& n : g_natives)
+    fprintf(stderr, "[jni] native %-32s %s @ %#llx\n", n.name.c_str(),
+            n.signature.c_str(),
+            static_cast<unsigned long long>(n.fn));
+}
 
 size_t arc_jni_call_count(void) { return g_total; }
 

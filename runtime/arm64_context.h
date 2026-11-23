@@ -61,6 +61,65 @@ typedef struct Arm64Ctx {
   uint64_t pc;
 } Arm64Ctx;
 
+// Linux syscall issued directly by guest code via `svc #0`. Defined beside the
+// shims in runtime/shim_syscall.cpp; the number is in x8 and the arguments in
+// x0..x5.
+int64_t arc_svc(Arm64Ctx* c);
+
+// A shadow call stack maintained by the lifted dispatcher. The AArch64 frame
+// pointer chain is not reliable enough for diagnostics: leaf functions need
+// not create a frame, and the lifted code keeps x29 in the context rather than
+// on the host stack. The dispatcher already sees every guest entry, so it can
+// record the exact chain on the way in and drop it on the way out.
+void arc_shadow_push(uint64_t address);
+void arc_shadow_pop(void);
+size_t arc_main_shadow_depth(void);
+uint64_t arc_main_shadow_at(size_t back);
+
+// A question asked at one instruction. Lifted code has no source line and no
+// symbol a debugger can stop at, so the one place a diagnostic can live is the
+// instruction itself: a probe call beside it prints four values, which is
+// usually the whole answer (a length, a mode, a byte and a limit). Probes are
+// temporary and gated by ARC_PROBE, so they cost nothing when nobody asks.
+void arc_probe(const char* tag, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
+// Same gate as arc_probe, for a NUL-terminated string in guest memory: naming
+// an object usually means naming its class, and a class name is a char*.
+void arc_probe_text(const char* tag, uint64_t address);
+// Dump guest bytes to a file named by ARC_PROBE_DUMP. A wrong answer is only
+// useful next to the right one: this is how the memory a lifted function just
+// produced gets compared offline with what the same work produces elsewhere.
+void arc_probe_dump(const char* tag, uint64_t address, uint64_t length);
+// A stalled coroutine is an iterator whose state word has stopped changing, and
+// the answer is the nested iterator it is waiting on. A state word is a number
+// but the awaited step is a class, so this prints the state beside the class
+// name of every pointer field. `fields` is how many words past the state to
+// inspect; 8 covers the wrap fields a compiler-generated iterator keeps.
+void arc_probe_iterator(const char* tag, uint64_t object, int fields);
+// A wait loop over a list of task contexts is only as useful as the names of the
+// tasks still in it: the state word says the director is waiting, not what it
+// waits for. This prints the list's unfinished entries (index, finished/pending
+// bytes, context id and the class of the task it is waiting on), and only when
+// that set changes, so a loop asked every frame stays one line per change.
+void arc_probe_subtasks(const char* tag, uint64_t director);
+// A sub task that never finishes is waiting on a yield instruction whose own
+// child task context is a separate object: the parent's bytes stay unfinished
+// whether the child never started or started and stalled, and only the child's
+// bytes tell those apart. This names the yield instruction and the method it
+// owns, so the child found from the parent can be traced back to its work item.
+void arc_probe_task_start(const char* tag, uint64_t yieldInstr, uint64_t outer,
+                          uint64_t method);
+// A task context is identified by ContextId/OriginalContextId, not by address:
+// those two ints are what tie a nested wait back to the sub task that started
+// it, and they are also what the notify paths have in hand.
+void arc_probe_ctx(const char* tag, uint64_t ctx);
+// An object whose class name is the whole answer at a one-branch call site.
+void arc_probe_obj(const char* tag, uint64_t object);
+// Shelp request lifecycle: module/method id, queue state, retry count.
+void arc_probe_req(const char* tag, uint64_t req);
+// A call site that only needs to record that it was reached.
+void arc_probe_val(const char* tag, uint64_t value);
+// One field of one object, resolved to a libil2cpp offset when it is code.
+void arc_probe_slot(const char* tag, uint64_t object, uint64_t offset);
 // --- register access -------------------------------------------------------
 #define ARC_X_R(c, r) ((r) == 31 ? UINT64_C(0) : (c)->x[(r)])
 // The value is computed into a temporary *before* the destination is tested,
@@ -156,32 +215,70 @@ static inline uint32_t arc_ror32(uint32_t v, unsigned n) {
 }
 
 // --- memory ----------------------------------------------------------------
-// Guest addresses are host addresses; see the note at the top. memcpy rather
-// than a pointer cast because the guest is free to make unaligned accesses that
-// a strict-aliasing compiler would otherwise be entitled to miscompile.
+// Guest addresses are host addresses; see the note at the top. The guest is
+// free to make unaligned accesses, so MSVC is told that explicitly; x64 has no
+// unaligned-fault case and the qualifier emits the same scalar load or store a
+// memcpy would, without the call the generated units were making for every
+// access. Other compilers keep the memcpy spelling, which is their portable
+// way to say the same thing.
 static inline uint64_t arc_ld64(uint64_t a) {
+#if defined(_MSC_VER)
+  return *(const uint64_t __unaligned*)(uintptr_t)a;
+#else
   uint64_t v; memcpy(&v, (const void*)(uintptr_t)a, 8); return v;
+#endif
 }
 static inline uint32_t arc_ld32(uint64_t a) {
+#if defined(_MSC_VER)
+  return *(const uint32_t __unaligned*)(uintptr_t)a;
+#else
   uint32_t v; memcpy(&v, (const void*)(uintptr_t)a, 4); return v;
+#endif
 }
 static inline uint16_t arc_ld16(uint64_t a) {
+#if defined(_MSC_VER)
+  return *(const uint16_t __unaligned*)(uintptr_t)a;
+#else
   uint16_t v; memcpy(&v, (const void*)(uintptr_t)a, 2); return v;
+#endif
 }
 static inline uint8_t arc_ld8(uint64_t a) {
   return *(const uint8_t*)(uintptr_t)a;
 }
+// A managed object only has an address at runtime, so a data watch is armed by
+// a probe site (arc_watch_data) rather than by the command line. Disarmed it
+// costs one load per guest store.
+extern unsigned arc_data_watch_count;
+void arc_data_watch_hit(uint64_t address, uint64_t value, unsigned width);
+void arc_watch_data(uint64_t address, uint64_t length);
+
 static inline void arc_st64(uint64_t a, uint64_t v) {
+#if defined(_MSC_VER)
+  *(uint64_t __unaligned*)(uintptr_t)a = v;
+#else
   memcpy((void*)(uintptr_t)a, &v, 8);
+#endif
+  if (arc_data_watch_count) arc_data_watch_hit(a, v, 8);
 }
 static inline void arc_st32(uint64_t a, uint32_t v) {
+#if defined(_MSC_VER)
+  *(uint32_t __unaligned*)(uintptr_t)a = v;
+#else
   memcpy((void*)(uintptr_t)a, &v, 4);
+#endif
+  if (arc_data_watch_count) arc_data_watch_hit(a, v, 4);
 }
 static inline void arc_st16(uint64_t a, uint16_t v) {
+#if defined(_MSC_VER)
+  *(uint16_t __unaligned*)(uintptr_t)a = v;
+#else
   memcpy((void*)(uintptr_t)a, &v, 2);
+#endif
+  if (arc_data_watch_count) arc_data_watch_hit(a, v, 2);
 }
 static inline void arc_st8(uint64_t a, uint8_t v) {
   *(uint8_t*)(uintptr_t)a = v;
+  if (arc_data_watch_count) arc_data_watch_hit(a, v, 1);
 }
 
 // --- floating point --------------------------------------------------------
@@ -220,6 +317,30 @@ static inline void arc_du_w(Arm64Ctx* c, unsigned n, uint64_t v) {
 static inline void arc_q_w(Arm64Ctx* c, unsigned n, uint64_t lo, uint64_t hi) {
   c->q[n].u64[0] = lo;
   c->q[n].u64[1] = hi;
+}
+
+// Polynomial (carry-less) multiply over GF(2), the operation behind PMULL.
+// The 64x64 form produces a 128-bit result, which MSVC has no integer type
+// for, so the high half comes back through a pointer. Both halves are pure
+// XOR/shift, so the loop is exact and needs no table.
+static inline void arc_pmull64(uint64_t a, uint64_t b,
+                               uint64_t* lo, uint64_t* hi) {
+  uint64_t l = 0, h = 0;
+  for (int i = 0; i < 64; ++i) {
+    if ((b >> i) & 1u) {
+      l ^= a << i;
+      if (i) h ^= a >> (64 - i);
+    }
+  }
+  *lo = l;
+  *hi = h;
+}
+static inline uint16_t arc_pmull8(uint8_t a, uint8_t b) {
+  uint16_t r = 0;
+  for (int i = 0; i < 8; ++i) {
+    if ((b >> i) & 1u) r ^= (uint16_t)a << i;
+  }
+  return r;
 }
 
 // `fcmp` does not set flags the way an integer compare does, and the fourth
@@ -272,6 +393,60 @@ static inline double arc_dnan64(void) {
   double v;
   memcpy(&v, &b, 8);
   return v;
+}
+
+// IEEE binary16 conversion. The register file has no half view: a half is a
+// 16-bit pattern that only the conversion instructions interpret. Both
+// directions round to nearest, ties to even, and keep NaN payloads quiet.
+static inline float arc_f16_to_f32(uint16_t h) {
+  uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1fu;
+  uint32_t mant = h & 0x03ffu;
+  uint32_t bits;
+  if (exp == 0x1fu) {
+    bits = sign | 0x7f800000u | (mant << 13);
+  } else if (exp == 0) {
+    if (!mant) {
+      bits = sign;
+    } else {
+      int e = -14;
+      while (!(mant & 0x0400u)) { mant <<= 1; --e; }
+      mant &= 0x03ffu;
+      bits = sign | ((uint32_t)(e + 127) << 23) | (mant << 13);
+    }
+  } else {
+    bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+  }
+  float f;
+  memcpy(&f, &bits, 4);
+  return f;
+}
+static inline uint16_t arc_f32_to_f16(float f) {
+  uint32_t x;
+  memcpy(&x, &f, 4);
+  uint16_t sign = (uint16_t)((x >> 16) & 0x8000u);
+  uint32_t exp = (x >> 23) & 0xffu;
+  uint32_t mant = x & 0x007fffffu;
+  if (exp == 0xffu) {
+    uint16_t nan = mant ? (uint16_t)(0x0200u | (mant >> 13)) : 0;
+    return (uint16_t)(sign | 0x7c00u | nan);
+  }
+  int e = (int)exp - 127 + 15;
+  if (e >= 31) return (uint16_t)(sign | 0x7c00u);
+  if (e <= 0) {
+    if (e < -10) return sign;
+    mant |= 0x00800000u;
+    int shift = 14 - e;
+    uint32_t half = mant >> shift;
+    uint32_t rem = mant & ((1u << shift) - 1u);
+    uint32_t halfway = 1u << (shift - 1);
+    if (rem > halfway || (rem == halfway && (half & 1u))) ++half;
+    return (uint16_t)(sign | (uint16_t)half);
+  }
+  uint32_t half = ((uint32_t)e << 10) | (mant >> 13);
+  uint32_t rem = mant & 0x1fffu;
+  if (rem > 0x1000u || (rem == 0x1000u && (half & 1u))) ++half;
+  return (uint16_t)(sign | (uint16_t)half);
 }
 
 #define ARC_MINMAX(suffix, type, quiet)                                    \
@@ -508,6 +683,9 @@ static inline uint32_t arc_rbit32(uint32_t v) {
   for (int i = 0; i < 32; ++i) { r = (r << 1) | (v & 1); v >>= 1; }
   return r;
 }
+static inline uint8_t arc_rbit8(uint8_t v) {
+  return (uint8_t)(arc_rbit32(v) >> 24);
+}
 static inline uint64_t arc_rev64(uint64_t v) {
   uint64_t r = 0;
   for (int i = 0; i < 8; ++i) { r = (r << 8) | (v & 0xFF); v >>= 8; }
@@ -600,6 +778,9 @@ void arc_trap(Arm64Ctx* c, const char* what);
 // The buffer is a jmp_buf; kept as void* so this header needs no <setjmp.h>.
 void arc_set_recovery(void* jmp_buffer);
 const char* arc_last_trap(void);
+// The register file at the last trap, or NULL. A trap says where control went;
+// naming what the pointers meant is the caller's job.
+const Arm64Ctx* arc_last_trap_context(void);
 
 // --- calling out of the guest ----------------------------------------------
 // An import is reached the same way a virtual method is: the guest loads a GOT
@@ -619,6 +800,54 @@ void arc_register_ctx_native(uint64_t address, const char* name, ArcCtxFn fn);
 
 // Called by the generated dispatcher when the lifted table has no entry.
 void arc_dispatch_miss(Arm64Ctx* c, uint64_t target);
+
+// --- answering a guest function from the host ------------------------------
+// Some guest functions carry policy rather than behaviour: a certificate
+// verifier deciding whether a chain is acceptable, a check deciding whether a
+// build counts as debuggable. The answer belongs to whoever built this host --
+// it depends on what the port points the guest at -- and it cannot be given,
+// because the guest's copy is compiled in and its image is stripped.
+//
+// `arc_guest_answer` registers that answer: when the dispatcher is asked to
+// enter `image`+`offset`, it returns `value` in x0 instead of running the
+// function. It reaches exactly the calls that go through the dispatcher -- an
+// indirect branch, which is what a cross-image call and a preemptible (exported)
+// symbol both compile to. A call the lifter turned into a direct host call is
+// not routed here, so this is not a general code patcher; it is the entry-point
+// seam a port actually has.
+//
+// Register before the guest runs: the table is read without a lock, because
+// adding to it while a guest thread is mid-dispatch would be a data race for no
+// reason.
+void arc_guest_answer(int image, uint64_t offset, uint64_t value,
+                      const char* what);
+
+// --- retiring a lifted body -------------------------------------------------
+// arc_guest_answer works when a call arrives through the dispatcher: an
+// indirect branch, which is what a cross-image call and a preemptible symbol
+// both compile to. It cannot reach a call the lifter turned into a direct host
+// call -- inside one image, most calls are direct, and then the guest's call
+// graph no longer exists at runtime: the reachable code is a host function with
+// a name.
+//
+// `arc_lifted_return` retires that body: it replaces the function's first
+// instruction with a return, so the call becomes a no-op that leaves x0 as the
+// caller set it. Use it for a function whose whole job belongs to the host --
+// a policy decision this build makes differently, or a subsystem the host
+// replaces -- and prefer arc_guest_answer whenever the call is indirect, since
+// that one is visible in the guest's own terms.
+//
+// It must be called before the guest runs. Returns non-zero on success; on a
+// host that cannot write executable memory it refuses rather than pretending.
+int arc_lifted_return(void* fn, const char* what);
+
+// Diagnostic for the one monitor path that cannot be right: an Exit that finds
+// the lock held by an id other than this thread's pthread_self. Prints the
+// monitor block, both ids and the host thread id when ARC_TRACE_MONITOR is set.
+void arc_mon_set(uint64_t obj, uint64_t lr);
+void arc_mon_enter(uint64_t obj);
+void arc_mon_note(uint64_t data, uint64_t owner, uint64_t self,
+                  uint64_t flags, uint64_t nest);
 
 // What an address is, in words, for the host to fill in. The runtime knows an
 // indirect branch went somewhere it does not recognise; only the host knows
@@ -677,9 +906,27 @@ void arc_frame_note(uint64_t packed);
 #define arc_frame_note(packed) ((void)0)
 #endif
 size_t arc_frame_count(void);
+// A direct guest-to-guest call has no dispatcher seam, so a lifted body calls
+// this at entry when it wants the port to be able to answer it. Returns
+// non-zero when the answer came from ARC_FN_RET (`offset=value`, image-0
+// address space) and stores it in *out.
+int arc_entry_return(uint64_t packed, uint64_t* out);
+// A title may replace a hot managed helper with a native fast path.  The
+// lifted body calls this before its own prologue and runs itself when the
+// answer is zero, so the lifted code stays the semantic reference.  The offset
+// is an image-0 offset, the same space as ARC_FN_RET.
+int arc_title_fast_path(Arm64Ctx* c, uint64_t guest_offset);
 size_t arc_frame_seen(void);
 uint64_t arc_frame_at(size_t back);  // 0 is the most recent
 void arc_frame_clear(void);
+
+// The boot thread's own slice of the same history. The global ring is
+// dominated by busy workers during a startup stall, so this is the ring that
+// answers "what is the main thread waiting in?"
+void arc_mark_main_thread(void);
+size_t arc_main_frame_count(void);
+size_t arc_main_frame_seen(void);
+uint64_t arc_main_frame_at(size_t back);
 
 /* A per-frame tally of how often each guest function ran, for finding a loop
    that runs once per drawn thing. Off unless ARC_FN_CENSUS is set. */
@@ -688,6 +935,12 @@ void arc_census_report(int top);
 int arc_census_pending(void);
 size_t arc_trace_count(void);
 const char* arc_trace_at(size_t back);  // 0 is the most recent
+
+// The host import called most recently on this thread, with the guest return
+// address and the first arguments. A fault inside a host routine otherwise
+// names only the routine; this says which guest call reached it.
+const char* arc_last_native(uint64_t* lr, uint64_t* lr_shadow, uint64_t* a0,
+                            uint64_t* a1, uint64_t* a2);
 void arc_trace_clear(void);
 
 typedef void (*Arc64Fn)(Arm64Ctx*);
@@ -705,6 +958,10 @@ void arc_set_dispatch(ArcDispatchFn fn);
 // Where the main image landed, so ARC_WATCH can name a function by offset.
 void arc_set_image_base(uint64_t base);
 void arc_dispatch(Arm64Ctx* c, uint64_t target);
+// The same dispatch, naming the guest branch that made it (packed image:offset,
+// as `pc` and the frame ring use). Emitted for indirect branches by a program
+// lifted with branch notes; `c->pc` is what a trap then reports.
+void arc_dispatch_pc(Arm64Ctx* c, uint64_t target, uint64_t pc);
 
 #ifdef __cplusplus
 }

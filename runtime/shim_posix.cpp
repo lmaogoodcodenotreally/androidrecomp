@@ -41,6 +41,7 @@
 #include <thread>
 
 #include "arm64_context.h"
+#include "arc_signal.h"
 #include "shim.h"
 
 #if defined(_WIN32)
@@ -145,17 +146,33 @@ int Gettimeofday(GuestTimeval* tv, void*) {
   return 0;
 }
 
+static void SleepWithSignals(std::chrono::nanoseconds total,
+                             const char* reason) {
+  const auto end = std::chrono::steady_clock::now() + total;
+  arc_set_wait_reason(reason);
+  for (;;) {
+    if (arc_signal_pending_current()) arc_run_pending_signals();
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= end) break;
+    auto slice = now + std::chrono::milliseconds(5);
+    if (slice > end) slice = end;
+    std::this_thread::sleep_until(slice);
+  }
+  arc_set_wait_reason(nullptr);
+}
+
 int Nanosleep(const GuestTimespec* req, GuestTimespec*) {
-  std::this_thread::sleep_for(std::chrono::seconds(req->tv_sec) +
-                              std::chrono::nanoseconds(req->tv_nsec));
+  SleepWithSignals(std::chrono::seconds(req->tv_sec) +
+                       std::chrono::nanoseconds(req->tv_nsec),
+                   "nanosleep");
   return 0;
 }
 int Usleep(unsigned useconds) {
-  std::this_thread::sleep_for(std::chrono::microseconds(useconds));
+  SleepWithSignals(std::chrono::microseconds(useconds), "usleep");
   return 0;
 }
 unsigned Sleep_(unsigned seconds) {
-  std::this_thread::sleep_for(std::chrono::seconds(seconds));
+  SleepWithSignals(std::chrono::seconds(seconds), "sleep");
   return 0;
 }
 
@@ -186,28 +203,58 @@ static_assert(offsetof(BionicTm, tm_zone) == 0x30, "tm_zone is at +0x30");
 // The zone name has to outlive the call, and the guest may ask on any thread.
 // Bionic's own answer points into its loaded timezone data and never expires,
 // so a per-thread buffer is the closest honest equivalent.
+//
+// Both answers are cached per DST state. The engine calls localtime on its
+// loading and network paths often enough that doing strftime("%Z") and two
+// timezone queries per call made date formatting the dominant cost in the
+// first slow frames: the sampler put roughly two thirds of the main thread in
+// the CRT's string/time routines. The zone does not change mid-session, and
+// tm_isdst selects the only two answers there are.
+struct ZoneCache {
+  bool name_ready[2] = {false, false};
+  bool offset_ready[2] = {false, false};
+  char name[2][64] = {};
+  int64_t offset[2] = {0, 0};
+};
+
+ZoneCache& Zones() {
+  static thread_local ZoneCache cache;
+  return cache;
+}
+
 const char* ZoneName(const struct tm* host, bool utc) {
   if (utc) return "UTC";
-  static thread_local char name[64];
-  // %Z is the one portable way to ask the C library, and it already accounts
-  // for whether this timestamp is in daylight saving time.
-  if (strftime(name, sizeof name, "%Z", host) == 0) return "UTC";
-  return name;
+  const int dst = host->tm_isdst > 0 ? 1 : 0;
+  ZoneCache& zone = Zones();
+  if (!zone.name_ready[dst]) {
+    // %Z is the one portable way to ask the C library, and it already accounts
+    // for whether this timestamp is in daylight saving time.
+    if (strftime(zone.name[dst], sizeof zone.name[dst], "%Z", host) == 0)
+      std::snprintf(zone.name[dst], sizeof zone.name[dst], "UTC");
+    zone.name_ready[dst] = true;
+  }
+  return zone.name[dst];
 }
 
 int64_t ZoneOffset(const struct tm* host, bool utc) {
   if (utc) return 0;
+  const int dst = host->tm_isdst > 0 ? 1 : 0;
+  ZoneCache& zone = Zones();
+  if (!zone.offset_ready[dst]) {
 #if defined(_WIN32)
-  // Microsoft reports seconds *west* of UTC, and the daylight bias separately;
-  // tm_gmtoff is seconds east, with the bias already folded in.
-  long west = 0, bias = 0;
-  if (_get_timezone(&west) != 0) west = 0;
-  if (_get_dstbias(&bias) != 0) bias = 0;
-  return -static_cast<int64_t>(west + (host->tm_isdst > 0 ? bias : 0));
+    // Microsoft reports seconds *west* of UTC, and the daylight bias
+    // separately; tm_gmtoff is seconds east, with the bias already folded in.
+    long west = 0, bias = 0;
+    if (_get_timezone(&west) != 0) west = 0;
+    if (_get_dstbias(&bias) != 0) bias = 0;
+    zone.offset[dst] =
+        -static_cast<int64_t>(west + (dst ? bias : 0));
 #else
-  (void)host;
-  return 0;
+    zone.offset[dst] = 0;
 #endif
+    zone.offset_ready[dst] = true;
+  }
+  return zone.offset[dst];
 }
 
 void ToBionic(const struct tm* host, BionicTm* out, bool utc) {
@@ -316,6 +363,27 @@ BionicTm* Localtime(const time_t* t) {
 }
 
 long g_timezone = 0;  // data symbol
+// Bionic's `tzname` is an array of two mutable char pointers. A caller may
+// read it before calling tzset, so the entries have to be valid from load time.
+char* g_tzname[2] = {const_cast<char*>("UTC"), const_cast<char*>("UTC")};
+// The media-format key globals are string-valued data symbols, not functions.
+// A guest reads the pointer out of each one, so the variables, not the literal
+// strings, are what the imports have to name.
+const char* g_AMEDIAFORMAT_KEY_CHANNEL_COUNT = "channel-count";
+const char* g_AMEDIAFORMAT_KEY_COLOR_FORMAT = "color-format";
+const char* g_AMEDIAFORMAT_KEY_COLOR_RANGE = "color-range";
+const char* g_AMEDIAFORMAT_KEY_COLOR_STANDARD = "color-standard";
+const char* g_AMEDIAFORMAT_KEY_DURATION = "duration";
+const char* g_AMEDIAFORMAT_KEY_ENCODER_DELAY = "encoder-delay";
+const char* g_AMEDIAFORMAT_KEY_FRAME_RATE = "frame-rate";
+const char* g_AMEDIAFORMAT_KEY_HEIGHT = "height";
+const char* g_AMEDIAFORMAT_KEY_LANGUAGE = "language";
+const char* g_AMEDIAFORMAT_KEY_MIME = "mime";
+const char* g_AMEDIAFORMAT_KEY_ROTATION = "rotation-degrees";
+const char* g_AMEDIAFORMAT_KEY_SAMPLE_RATE = "sample-rate";
+const char* g_AMEDIAFORMAT_KEY_SLICE_HEIGHT = "slice-height";
+const char* g_AMEDIAFORMAT_KEY_STRIDE = "stride";
+const char* g_AMEDIAFORMAT_KEY_WIDTH = "width";
 
 // --- BSD / glibc string helpers --------------------------------------------
 
@@ -325,6 +393,40 @@ void* Memrchr(const void* s, int c, size_t n) {
     if (p[i - 1] == static_cast<unsigned char>(c))
       return const_cast<unsigned char*>(p + i - 1);
   return nullptr;
+}
+char* StrCasestr(const char* haystack, const char* needle) {
+  if (!haystack || !needle) return nullptr;
+  if (!*needle) return const_cast<char*>(haystack);
+  for (const char* p = haystack; *p; ++p) {
+    const char* a = p;
+    const char* b = needle;
+    while (*a && *b && tolower(static_cast<unsigned char>(*a)) ==
+                               tolower(static_cast<unsigned char>(*b))) {
+      ++a;
+      ++b;
+    }
+    if (!*b) return const_cast<char*>(p);
+  }
+  return nullptr;
+}
+int Flock(int, int) { return 0; }
+int Getpriority(int, int) { return 0; }
+long Ptrace(int, int, void*, void*) { return -1; }
+int SchedSetaffinity(int, size_t, const void*) { return 0; }
+// The guest reads the mask back to size its worker pool. Answering success
+// without writing it left the caller's buffer holding whatever was on its
+// stack, so the pool size was build- and timing-dependent. A one-core answer
+// there is what left the asset parse running on the same thread that was
+// waiting for it. Fill the mask from the same core count the procfs and
+// sysconf answers use.
+int SchedGetaffinity(int, size_t size, void* mask) {
+  if (!mask || size == 0) return -1;
+  std::memset(mask, 0, size);
+  const int64_t cores = HostCoreCount();
+  for (int64_t i = 0; i < cores && i < static_cast<int64_t>(size * 8); ++i)
+    static_cast<unsigned char*>(mask)[i / 8] |=
+        static_cast<unsigned char>(1u << (i % 8));
+  return 0;
 }
 
 char* StrtokR(char* str, const char* delim, char** saveptr) {
@@ -466,6 +568,14 @@ int Fprintf(FILE* f, const char* fmt, ...) {
 int Vfprintf(FILE* f, const char* fmt, va_list ap) {
   return vfprintf(Stream(f), fmt, ap);
 }
+int Vprintf(const char* fmt, va_list ap) { return vprintf(fmt, ap); }
+int Fscanf(FILE* f, const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vfscanf(Stream(f), fmt, ap);
+  va_end(ap);
+  return n;
+}
 size_t Fwrite(const void* p, size_t sz, size_t n, FILE* f) {
   return fwrite(p, sz, n, Stream(f));
 }
@@ -585,6 +695,33 @@ void Qsort(void* base, uint64_t n, uint64_t size, uint64_t compare) {
            static_cast<size_t>(size));
 }
 
+// bsearch has the same hazard as qsort: the comparator is guest code. Left to
+// the host's bsearch, the comparator is called as a host function pointer and
+// faults on execute, which is exactly what il2cpp's metadata lookup did.
+void* Bsearch(const void* key, const void* base, uint64_t n, uint64_t size,
+              uint64_t compare) {
+  if (!key || !base || !compare || !size || !n) return nullptr;
+  auto* bytes = static_cast<const uint8_t*>(base);
+  uint64_t lo = 0;
+  uint64_t hi = n;
+  while (lo < hi) {
+    const uint64_t mid = lo + (hi - lo) / 2;
+    const uint64_t args[2] = {
+        reinterpret_cast<uint64_t>(key),
+        reinterpret_cast<uint64_t>(bytes + mid * size)};
+    const int32_t order =
+        static_cast<int32_t>(arc_call_guest(compare, args, 2) & 0xFFFFFFFFu);
+    if (order < 0) {
+      hi = mid;
+    } else if (order > 0) {
+      lo = mid + 1;
+    } else {
+      return const_cast<uint8_t*>(bytes + mid * size);
+    }
+  }
+  return nullptr;
+}
+
 // The float-suffixed math the host defines inline rather than exporting, so a
 // by-name lookup misses them even though the code is there.
 float Frexpf(float v, int* e) { return frexpf(v, e); }
@@ -687,6 +824,7 @@ const Entry kTable[] = {
     E("gmtime_r", GmtimeR),
     E("localtime_r", LocaltimeR),
     E("timezone", g_timezone),
+    E("tzname", g_tzname),
     E("time", TimeNow),
     E("mktime", mktime),
     E("difftime", difftime),
@@ -696,9 +834,26 @@ const Entry kTable[] = {
 
     // stdio the host hides behind inline definitions
     E("__sF", g_sF),
+    E("AMEDIAFORMAT_KEY_CHANNEL_COUNT", g_AMEDIAFORMAT_KEY_CHANNEL_COUNT),
+    E("AMEDIAFORMAT_KEY_COLOR_FORMAT", g_AMEDIAFORMAT_KEY_COLOR_FORMAT),
+    E("AMEDIAFORMAT_KEY_COLOR_RANGE", g_AMEDIAFORMAT_KEY_COLOR_RANGE),
+    E("AMEDIAFORMAT_KEY_COLOR_STANDARD", g_AMEDIAFORMAT_KEY_COLOR_STANDARD),
+    E("AMEDIAFORMAT_KEY_DURATION", g_AMEDIAFORMAT_KEY_DURATION),
+    E("AMEDIAFORMAT_KEY_ENCODER_DELAY", g_AMEDIAFORMAT_KEY_ENCODER_DELAY),
+    E("AMEDIAFORMAT_KEY_FRAME_RATE", g_AMEDIAFORMAT_KEY_FRAME_RATE),
+    E("AMEDIAFORMAT_KEY_HEIGHT", g_AMEDIAFORMAT_KEY_HEIGHT),
+    E("AMEDIAFORMAT_KEY_LANGUAGE", g_AMEDIAFORMAT_KEY_LANGUAGE),
+    E("AMEDIAFORMAT_KEY_MIME", g_AMEDIAFORMAT_KEY_MIME),
+    E("AMEDIAFORMAT_KEY_ROTATION", g_AMEDIAFORMAT_KEY_ROTATION),
+    E("AMEDIAFORMAT_KEY_SAMPLE_RATE", g_AMEDIAFORMAT_KEY_SAMPLE_RATE),
+    E("AMEDIAFORMAT_KEY_SLICE_HEIGHT", g_AMEDIAFORMAT_KEY_SLICE_HEIGHT),
+    E("AMEDIAFORMAT_KEY_STRIDE", g_AMEDIAFORMAT_KEY_STRIDE),
+    E("AMEDIAFORMAT_KEY_WIDTH", g_AMEDIAFORMAT_KEY_WIDTH),
     E("_ctype_", g_ctype),
     E("fprintf", Fprintf),
     E("vfprintf", Vfprintf),
+    E("vprintf", Vprintf),
+    E("fscanf", Fscanf),
     E("fwrite", Fwrite),
     E("fread", Fread),
     E("fputs", Fputs),
@@ -707,7 +862,7 @@ const Entry kTable[] = {
     E("fclose", Fclose),
     E("getentropy", Getentropy),    E("getrandom", Getrandom),
     E("__cxa_thread_atexit_impl", CxaThreadAtexit),
-    E("qsort", Qsort),
+    E("qsort", Qsort),              E("bsearch", Bsearch),
     E("frexpf", Frexpf),            E("ldexpf", Ldexpf),
     E("hypotf", Hypotf),            E("isascii", Isascii),
     E("memalign", Memalign),        E("arc4random", Arc4random),
@@ -724,7 +879,11 @@ const Entry kTable[] = {
 
     // BSD / glibc string helpers
     E("memrchr", Memrchr),
+    E("strcasestr", StrCasestr),
     E("strtok_r", StrtokR),
+    E("flock", Flock),               E("getpriority", Getpriority),
+    E("ptrace", Ptrace),             E("sched_setaffinity", SchedSetaffinity),
+    E("sched_getaffinity", SchedGetaffinity),
     E("strerror_r", StrerrorR),
     E("basename", Basename),
 

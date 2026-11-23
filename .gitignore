@@ -68,6 +68,7 @@ verify.txt
 
 # lifted program and its build
 build-lifted/
+build-lifted-small/
 fnverify.txt
 obj_test/
 generated_test/

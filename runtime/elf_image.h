@@ -66,8 +66,19 @@ class ElfImage {
   // memory.
   bool Protect(std::string* err);
 
+  // Replace bytes in the mapped image, at an image virtual address.
+  //
+  // A port normally reimplements an image's behaviour rather than editing it,
+  // but some of an image's behaviour is policy welded into its own text: a
+  // statically linked TLS stack carries its own verifier, and a stripped strip
+  // of it has no seam to hook. Changing those bytes is then the honest option,
+  // and it belongs to whoever decided the policy -- the port -- not here.
+  bool Patch(uint64_t offset, const void* bytes, size_t length,
+             std::string* err);
+
   uint8_t* base() const { return base_; }
   uint64_t span() const { return span_; }
+  const std::string& name() const { return name_; }
   const std::vector<Segment>& segments() const { return segments_; }
   const std::vector<std::string>& needed() const { return needed_; }
   const std::vector<Import>& imports() const { return imports_; }
@@ -88,6 +99,7 @@ class ElfImage {
   uint8_t* base_ = nullptr;
   uint64_t span_ = 0;
   uint8_t* traps_ = nullptr;  // guard page; unresolved imports point in here
+  std::string name_;          // file name, for dlopen's handle lookup
 
   const uint8_t* symtab_ = nullptr;
   const char* strtab_ = nullptr;

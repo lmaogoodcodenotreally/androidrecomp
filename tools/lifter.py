@@ -451,6 +451,35 @@ class Lifter:
                 return [f"arc_q_w(c, {d}, (c)->q[{n}].u64[0], 0);"]
             return [f"(c)->q[{d}] = (c)->q[{n}];"]
 
+        # Polynomial multiply. The 64x64 -> 128 form is GHASH's building
+        # block; the 8x8 -> 16 form is the same operation a byte at a time.
+        # The wide destination is `.1q`, an arrangement VAS_INFO cannot
+        # describe, so it has to be answered before the generic path asks
+        # the destination for its lanes.
+        if m in ("pmull", "pmull2") and len(ops) == 3:
+            if ".1q" in insn.op_str:
+                lane = 1 if m == "pmull2" else 0
+                dst = self.vreg_index(ops[0])
+                a = f"(c)->q[{self.vreg_index(ops[1])}].u64[{lane}]"
+                b = f"(c)->q[{self.vreg_index(ops[2])}].u64[{lane}]"
+                return [f"{{ uint64_t _lo, _hi;"
+                        f" arc_pmull64({a}, {b}, &_lo, &_hi);"
+                        f" arc_q_w(c, {dst}, _lo, _hi); }}"]
+            info = self.vas_of(ops[0])
+            sinfo = self.vas_of(ops[1])
+            if not info or not sinfo:
+                raise Unsupported(f"{m} arrangement")
+            lanes, view, bits = info
+            slanes, s_view, sbits = sinfo
+            if bits != 16 or sbits != 8:
+                raise Unsupported(f"{m} between {sbits} and {bits}")
+            base = slanes - lanes if m == "pmull2" else 0
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = arc_pmull8("
+                f"(uint8_t){self.vec_elem(ops[1], base + i, s_view)},"
+                f" (uint8_t){self.vec_elem(ops[2], base + i, s_view)});"
+                for i in range(lanes)])
+
         # `fmov vD.4s, #1.0` broadcasts a floating-point immediate.
         if m == "fmov" and self.is_vector(ops[0]) and \
                 ops[1].type == a64.ARM64_OP_FP:
@@ -1111,6 +1140,32 @@ class Lifter:
                 f"({self.vec_elem(ops[1], base + i, s_view)}) << {sbits};"
                 for i in range(lanes)])
 
+        # Shift and insert. Both read the destination as well as write it:
+        # the vacated bits are filled from the old destination, and the rest
+        # comes from the source. SLI keeps the low `shift` bits of the old
+        # destination; SRI keeps its high `shift` bits.
+        if m in ("sli", "sri") and len(ops) == 3 \
+                and ops[2].type == a64.ARM64_OP_IMM:
+            n = ops[2].imm
+            if n <= 0 or n >= bits:
+                raise Unsupported(f"{m} by {n}")
+            if m == "sli":
+                keep = (1 << n) - 1
+                body = [
+                    f"  _t.{view}[{i}] = (uint{bits}_t)((uint{bits}_t)"
+                    f"({self.vec_elem(ops[1], i, view)}) << {n} |"
+                    f" ((uint{bits}_t)_t.{view}[{i}] & UINT64_C({keep})));"
+                    for i in range(lanes)]
+            else:
+                keep = ((1 << n) - 1) << (bits - n)
+                body = [
+                    f"  _t.{view}[{i}] = (uint{bits}_t)((uint{bits}_t)"
+                    f"({self.vec_elem(ops[1], i, view)}) >> {n} |"
+                    f" ((uint{bits}_t)_t.{view}[{i}] & UINT64_C({keep})));"
+                    for i in range(lanes)]
+            return self.vec_result_keep(ops[0], body,
+                                        clear_top=lanes * bits == 64)
+
         # Widening absolute difference: both operands are halves of narrower
         # registers, and the result cannot overflow the wider lane.
         if m in ("uabdl", "uabdl2", "sabdl", "sabdl2") and len(ops) == 3:
@@ -1178,6 +1233,25 @@ class Lifter:
             if not sinfo:
                 raise Unsupported(f"{m} source arrangement")
             slanes, _, sbits = sinfo
+            # Half precision is not an f32/f64 narrowing: the union has no
+            # half view, so both directions go through IEEE binary16 helpers.
+            if sbits == 16 and bits == 32:
+                base = slanes - lanes if m.endswith("2") else 0
+                return self.vec_result(ops[0], [
+                    f"  _t.f32[{i}] = arc_f16_to_f32("
+                    f"{self.vec_elem(ops[1], base + i, 'u16')});"
+                    for i in range(lanes)])
+            if sbits == 32 and bits == 16:
+                if m.endswith("2"):
+                    return self.vec_result_keep(ops[0], [
+                        f"  _t.{view}[{lanes - slanes + i}] ="
+                        f" arc_f32_to_f16("
+                        f"{self.vec_elem(ops[1], i, 'f32')});"
+                        for i in range(slanes)])
+                return self.vec_result(ops[0], [
+                    f"  _t.{view}[{i}] = arc_f32_to_f16("
+                    f"{self.vec_elem(ops[1], i, 'f32')});"
+                    for i in range(slanes)])
             src_f = {32: "f32", 64: "f64"}.get(sbits)
             if not src_f or not fview:
                 raise Unsupported(f"{m} between {sbits} and {bits}")
@@ -1197,27 +1271,44 @@ class Lifter:
                 f"  _t.{fview}[{i}] = ({ctype})"
                 f"{self.vec_elem(ops[1], i, src_f)};" for i in range(slanes)])
 
-        # Pairwise add across two vectors: the destination's first half comes
-        # from adjacent pairs of the first source, the second half from the
-        # second source.
-        if m in ("addp", "faddp") and len(ops) == 3:
+        # Pairwise operations across two vectors: the destination's first half
+        # comes from adjacent pairs of the first source, the second half from
+        # the second source. Min/max are the same shape as add; only the
+        # combining operation changes, and signedness comes from the mnemonic.
+        if m in ("addp", "faddp", "smaxp", "sminp", "umaxp", "uminp",
+                 "fmaxp", "fminp") and len(ops) == 3:
             half = lanes // 2
             body = []
             for i in range(lanes):
                 src = ops[1] if i < half else ops[2]
                 j = (i if i < half else i - half) * 2
-                if m == "faddp":
+                if m in ("faddp", "fmaxp", "fminp"):
                     if not fview:
                         raise Unsupported(f"{m} on {bits}-bit lanes")
+                    fn = {"faddp": "arc_fadd", "fmaxp": "arc_fmax",
+                          "fminp": "arc_fmin"}[m] + str(bits)
                     body.append(
-                        f"  _t.{fview}[{i}] = arc_fadd{bits}("
+                        f"  _t.{fview}[{i}] = {fn}("
                         f"{self.vec_elem(src, j, fview)},"
                         f" {self.vec_elem(src, j + 1, fview)});")
-                else:
+                elif m == "addp":
                     body.append(
                         f"  _t.{view}[{i}] = (uint{bits}_t)("
                         f"{self.vec_elem(src, j, view)} +"
                         f" {self.vec_elem(src, j + 1, view)});")
+                elif m[0] == "s":
+                    cmp = ">" if m == "smaxp" else "<"
+                    a = f"(int{bits}_t){self.vec_elem(src, j, sview)}"
+                    b = f"(int{bits}_t){self.vec_elem(src, j + 1, sview)}"
+                    body.append(
+                        f"  _t.{view}[{i}] = (uint{bits}_t)(({a} {cmp} {b})"
+                        f" ? {a} : {b});")
+                else:
+                    cmp = ">" if m == "umaxp" else "<"
+                    a = self.vec_elem(src, j, view)
+                    b = self.vec_elem(src, j + 1, view)
+                    body.append(
+                        f"  _t.{view}[{i}] = ({a} {cmp} {b}) ? {a} : {b};")
             return self.vec_result(ops[0], body)
 
         # Rounding shift right, and the accumulating form. The rounding is half
@@ -1338,6 +1429,120 @@ class Lifter:
                 f" {self.vec_source(ops[2], i, fview)});"
                 for i in range(lanes)])
 
+        # Reciprocal estimate and Newton step. The estimate is exact division
+        # where the hardware uses an 8-bit table; that is a strictly better
+        # starting point, and every caller follows it with the step below, so
+        # the converged result is the same. The step forms are exact: they are
+        # `2 - x*y` and `(3 - x*y)/2` by definition.
+        if m in ("frecpe", "frsqrte") and len(ops) == 2 and fview:
+            f = "f" if bits == 32 else ""
+            if m == "frecpe":
+                body = [f"  _t.{fview}[{i}] = 1.0{f} /"
+                        f" {self.vec_source(ops[1], i, fview)};"
+                        for i in range(lanes)]
+            else:
+                body = [f"  _t.{fview}[{i}] = 1.0{f} /"
+                        f" arc_fsqrt{bits}("
+                        f"{self.vec_source(ops[1], i, fview)});"
+                        for i in range(lanes)]
+            return self.vec_result(ops[0], body)
+
+        if m in ("frecps", "frsqrts") and len(ops) == 3 and fview:
+            f = "f" if bits == 32 else ""
+            body = []
+            for i in range(lanes):
+                prod = (f"({self.vec_source(ops[1], i, fview)} *"
+                        f" {self.vec_source(ops[2], i, fview)})")
+                if m == "frecps":
+                    body.append(f"  _t.{fview}[{i}] = 2.0{f} - {prod};")
+                else:
+                    body.append(
+                        f"  _t.{fview}[{i}] = (3.0{f} - {prod}) * 0.5{f};")
+            return self.vec_result(ops[0], body)
+
+        # Saturating extract-narrow. The high-half form writes the upper
+        # lanes and leaves the lower ones alone.
+        if m in ("uqxtn", "sqxtn", "uqxtn2", "sqxtn2") and len(ops) == 2:
+            sinfo = self.vas_of(ops[1])
+            if not sinfo:
+                raise Unsupported(f"{m} source arrangement")
+            slanes, s_view, sbits = sinfo
+            if sbits != 2 * bits:
+                raise Unsupported(f"{m} from {sbits} to {bits}")
+            signed = m.startswith("sq")
+            src_view = self.signed_view(sbits) if signed else s_view
+            src_cast = f"int{sbits}_t" if signed else f"uint{sbits}_t"
+            lo, hi = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+            dest = lanes - slanes if m.endswith("2") else 0
+
+            def narrow(i):
+                v = f"({src_cast}){self.vec_elem(ops[1], i, src_view)}"
+                if signed:
+                    return (f"(uint{bits}_t)(int{bits}_t)({v} < {lo} ? {lo} :"
+                            f" {v} > {hi} ? {hi} : {v})")
+                return f"(uint{bits}_t)({v} > {hi} ? {hi} : {v})"
+
+            body = [f"  _t.{view}[{dest + i}] = {narrow(i)};"
+                    for i in range(slanes)]
+            if m.endswith("2"):
+                return self.vec_result_keep(ops[0], body)
+            return self.vec_result(ops[0], body)
+
+        # Reverse the bits inside each byte.
+        if m == "rbit" and self.is_vector(ops[0]) and len(ops) == 2:
+            info = self.vas_of(ops[0])
+            if not info or info[2] != 8:
+                raise Unsupported("vector rbit arrangement")
+            return self.vec_result(ops[0], [
+                f"  _t.u8[{i}] = arc_rbit8("
+                f"{self.vec_source(ops[1], i, 'u8')});"
+                for i in range(info[0])])
+
+        # Interleave the low (zip1) or high (zip2) halves of two vectors.
+        if m in ("zip1", "zip2") and len(ops) == 3:
+            half = lanes // 2
+            base = half if m == "zip2" else 0
+            body = []
+            for i in range(lanes):
+                src = ops[1] if i % 2 == 0 else ops[2]
+                body.append(f"  _t.{view}[{i}] ="
+                            f" {self.vec_elem(src, base + i // 2, view)};")
+            return self.vec_result(ops[0], body)
+
+        # Unsigned saturating shift left by an immediate.
+        if m == "uqshl" and len(ops) == 3 \
+                and ops[2].type == a64.ARM64_OP_IMM:
+            n = ops[2].imm
+            if n < 0 or n >= bits:
+                raise Unsupported(f"uqshl by {n}")
+            hi = (1 << bits) - 1
+            return self.vec_result(ops[0], [
+                f"  _t.{view}[{i}] = (uint{bits}_t)"
+                f"(((uint64_t){self.vec_source(ops[1], i, view)} << {n}) >"
+                f" UINT64_C({hi}) ? UINT64_C({hi}) :"
+                f" ((uint64_t){self.vec_source(ops[1], i, view)} << {n}));"
+                for i in range(lanes)])
+
+        # Signed halving subtract: the difference is formed in a wider type so
+        # it cannot overflow, then shifted right by one.
+        if m == "shsub" and len(ops) == 3 and bits <= 32:
+            cast = f"int{bits}_t"
+            body = []
+            for i in range(lanes):
+                a = f"(int64_t)({cast}){self.vec_source(ops[1], i, sview)}"
+                b = f"(int64_t)({cast}){self.vec_source(ops[2], i, sview)}"
+                body.append(f"  _t.{view}[{i}] = (uint{bits}_t)({cast})"
+                            f"(({a} - {b}) >> 1);")
+            return self.vec_result(ops[0], body)
+
+        # AES round primitives. x86-64 has equivalents but they order the
+        # round differently (AESE adds the key before SubBytes, AESENC after
+        # MixColumns), so this is not a rename. Trap instead of failing the
+        # whole function: OpenSSL picks its C/NEON path when getauxval reports
+        # no crypto extensions, so the trap is normally never reached.
+        if m in ("aese", "aesd", "aesmc", "aesimc"):
+            return [f"arc_trap(c, \"{m}\");"]
+
         raise Unsupported(f"vector {m}")
 
     # --- instruction emitters ----------------------------------------------
@@ -1371,6 +1576,25 @@ class Lifter:
         # here, before any scalar emitter gets a chance at them.
         if any(self.is_vector(o) for o in ops):
             return self.emit_vector(insn, ops)
+
+        # Scalar integer compare-equal. Its destination is an FP register and
+        # the result is all-ones or zero, exactly as in the vector form. It is
+        # reachable here because `d2` is a scalar register, not a `v` one.
+        if m == "cmeq" and len(ops) == 3 \
+                and self.fp_of(ops[0]) is not None:
+            d, kind = self.fp_of(ops[0])
+            n = self.fp_of(ops[1])
+            mm = self.fp_of(ops[2])
+            if n is None or mm is None:
+                raise Unsupported("scalar cmeq operands")
+            if kind == "s":
+                return [f"arc_su_w(c, {d}, ((c)->q[{n[0]}].u32[0] =="
+                        f" (c)->q[{mm[0]}].u32[0]) ? UINT32_MAX : 0);"]
+            if kind == "d":
+                return [f"arc_du_w(c, {d}, ((c)->q[{n[0]}].u64[0] =="
+                        f" (c)->q[{mm[0]}].u64[0]) ?"
+                        f" UINT64_C(0xFFFFFFFFFFFFFFFF) : 0);"]
+            raise Unsupported(f"scalar cmeq on {kind}")
 
         def arith(op_c: str, set_flags: bool, sub: bool = False):
             d, a, b = ops[0], ops[1], ops[2] if len(ops) > 2 else None
@@ -1677,6 +1901,22 @@ class Lifter:
             return [f"/* {m}: pointer authentication is identity when lifted */"]
         if m == "brk":
             return ["arc_trap(c, \"brk\");"]
+        # UDF is the architecture's deliberate trap: unreachable code, a
+        # switch default that cannot happen, an assertion the compiler was
+        # told about. IL2CPP emits it at the end of functions whose last
+        # call never returns, and there are 35k of them in libil2cpp. They
+        # are not an unsupported form -- they lift exactly as well as BRK --
+        # and treating them as one used to fail ~8.5k whole functions.
+        if m in ("udf", "hlt"):
+            return [f"arc_trap(c, \"{m}\");"]
+        # A direct Linux syscall. libil2cpp statically links a few bionic
+        # wrappers that issue `svc` themselves instead of calling libc, so
+        # this is not an unsupported form -- it is a call the host has to
+        # answer. The dispatcher reads the number from x8 and the arguments
+        # from x0..x5, the architecture's syscall ABI, and returns the raw
+        # negative-errno result in x0.
+        if m == "svc":
+            return ["ARC_X_W(c, 0, (uint64_t)arc_svc(c));"]
 
         # -- floating point
         # Scalar FP maps onto C's own float and double, which is the whole
@@ -1862,6 +2102,32 @@ class Lifter:
             return [self.write(
                 status,
                 f"arc_store_exclusive(c, {addr}, {self.read(val)}, {size})")]
+
+        # 128-bit exclusive pairs. The host has no portable 16-byte atomic, but
+        # the guest uses these for two-word reads and writes; two naturally
+        # aligned accesses are a faithful enough model, and the store always
+        # reports success.
+        if m in ("ldxp", "ldaxp") and len(ops) == 3:
+            d0, d1, mem = ops[0], ops[1], self.find_mem(ops)
+            if mem is None:
+                raise Unsupported("exclusive pair addressing")
+            addr = self.mem_address(mem, insn)
+            is64 = reg_of(self.md, d0.reg)[1]
+            size = 8 if is64 else 4
+            load = "arc_ld64" if is64 else "arc_ld32"
+            return [self.write(d0, f"{load}({addr})"),
+                    self.write(d1, f"{load}(({addr}) + {size})")]
+        if m in ("stxp", "stlxp") and len(ops) == 4:
+            status, v0, v1, mem = ops[0], ops[1], ops[2], self.find_mem(ops)
+            if mem is None:
+                raise Unsupported("exclusive pair addressing")
+            addr = self.mem_address(mem, insn)
+            is64 = reg_of(self.md, v0.reg)[1]
+            size = 8 if is64 else 4
+            store = "arc_st64" if is64 else "arc_st32"
+            return [f"{store}({addr}, {self.read(v0)});",
+                    f"{store}(({addr}) + {size}, {self.read(v1)});",
+                    self.write(status, "0")]
 
         # -- bitfield
         # Capstone hands these over as (dest, source, lsb, width), which is the
@@ -2272,6 +2538,27 @@ class Lifter:
         def num(op):
             return reg_of(self.md, op.reg)[0]
 
+        def local_table(base: int) -> list[int]:
+            """Targets named by a table of 32-bit offsets at `base`.
+
+            Obfuscated dispatchers sometimes put the table in the instruction
+            stream itself: the first word is `udf #4`, whose encoding is the
+            offset 4, so `adr L; ldrsw x, [L]; add x, x, L; br x` lands on the
+            instruction after the `udf`. Reading the word as an offset is the
+            same operation the guest performs; entries are consumed until one
+            leaves this function.
+            """
+            out: list[int] = []
+            for i in range(4096):
+                v = self.read_image(base + i * 4, 4, True)
+                if v is None:
+                    break
+                t = (base + v) & 0xFFFFFFFFFFFFFFFF
+                if not (start <= t < end) or t % 4:
+                    break
+                out.append(t)
+            return out
+
         const: dict[int, int] = {}
         # The same values, never invalidated. A big function sets a jump
         # table's base in one block and branches through it in another, with
@@ -2281,6 +2568,14 @@ class Lifter:
         # target still has to land inside this function on a four-byte
         # boundary, and a wrong base fails on the first entry.
         seen: dict[int, int] = {}
+        # The `adr` labels just before the current instruction. Obfuscated
+        # dispatch sequences compute the branch register through
+        # `and`/`eor`/`mul` with values loaded from the stack, so no single
+        # register's value is known; the landing pad is still named by an `adr`
+        # a few instructions earlier. Keeping a short window rather than every
+        # `adr` in the function is what keeps the generated switch from
+        # exploding in large functions.
+        recent_adrs: list[int] = []
         load: dict[int, tuple[int, int, bool]] = {}
         pend: dict[int, tuple[tuple[int, int, bool], int, int]] = {}
         pend_reg: dict[int, tuple[int, int, tuple[int, int]]] = {}
@@ -2295,9 +2590,32 @@ class Lifter:
                         and ops[1].type == a64.ARM64_OP_IMM:
                     d = num(ops[0])
                     const[d] = seen[d] = ops[1].imm
+                    if m == "adr":
+                        recent_adrs.append(ops[1].imm)
+                        if len(recent_adrs) > 16:
+                            del recent_adrs[:-16]
                     load.pop(d, None)
                     pend.pop(d, None)
                     pend_reg.pop(d, None)
+                elif m == "mov" and len(ops) == 2 \
+                        and ops[1].type == a64.ARM64_OP_REG:
+                    # The base of a jump table is often copied out of the way
+                    # before the entry load overwrites the register holding it:
+                    #   mov x11, x9; ldrsw x9, [x9, x10, lsl #2]
+                    #   add x9, x9, x11; br x9
+                    # Without carrying the value across the copy, the `add` has
+                    # no known base, no targets are recorded, and the switch is
+                    # left to the dispatcher -- which cannot enter this function
+                    # halfway through it, so the branch traps.
+                    d = num(ops[0])
+                    v = const.get(num(ops[1]), seen.get(num(ops[1])))
+                    const.pop(d, None)
+                    load.pop(d, None)
+                    pend.pop(d, None)
+                    pend_reg.pop(d, None)
+                    seen.pop(d, None)
+                    if v is not None:
+                        const[d] = seen[d] = v
                 elif m == "add" and len(ops) == 3 \
                         and ops[2].type == a64.ARM64_OP_IMM \
                         and num(ops[1]) in const:
@@ -2381,6 +2699,22 @@ class Lifter:
                         targets = [t for t in
                                    (base + (i << shift) for i in range(lo, hi + 1))
                                    if start <= t < end and not t % 4]
+                    if not targets:
+                        # Obfuscated dispatch: `adr x9, L; and/eor/mul x8,
+                        # x9, xN; br x8`. What xN holds is loaded from the
+                        # stack, so no value is known at generation time, but
+                        # the landing pad was named by an `adr` just above. A
+                        # branch that matches one is a local jump; one that
+                        # does not falls through to the dispatcher. `L` may
+                        # itself hold a table of offsets -- including a single
+                        # `udf #4` whose encoding points past the trap -- so
+                        # the offsets at `L` are candidates too.
+                        candidates = set(t for t in recent_adrs
+                                         if start <= t < end and not t % 4)
+                        for t in recent_adrs:
+                            if start <= t < end and not t % 4:
+                                candidates.update(local_table(t))
+                        targets = sorted(candidates)
                     if targets:
                         tables[insn.address] = targets
                 elif ops and ops[0].type == a64.ARM64_OP_REG:
@@ -2446,11 +2780,19 @@ class Lifter:
 
 
 def code_sections(elf: ELFFile) -> list[tuple[int, bytes]]:
-    """Every section holding instructions we may need to lift."""
+    """Every section holding instructions we may need to lift.
+
+    Not just `.text` and `.plt`. Linkers let a program name its own executable
+    section, and Unity uses that: `libil2cpp` carries a large `il2cpp` section
+    beside `.text`, while `libs2pcore` keeps three abseil allocator routines in
+    a `malloc_hook` section. Treating only the conventional names as code makes
+    those routines invisible, so a function pointer into one of them reaches
+    the dispatcher as an address it has never heard of.
+    """
     out = []
-    for name in (".text", ".plt"):
-        sec = elf.get_section_by_name(name)
-        if sec is not None:
+    for sec in elf.iter_sections():
+        # SHF_ALLOC | SHF_EXECINSTR, with bytes present in the file.
+        if (sec["sh_flags"] & 0x6) == 0x6 and sec["sh_type"] != "SHT_NOBITS":
             out.append((sec["sh_addr"], sec.data()))
     return out
 
@@ -2512,25 +2854,50 @@ def functions_from_symbols(elf: ELFFile) -> list[tuple[int, int]]:
     An `STT_FUNC` symbol with a nonzero size is exactly the pair we need, and it
     comes from the linker rather than a heuristic. Duplicates with `.eh_frame`
     are harmless -- the caller sorts and the emitter takes each start once.
+
+    A second shape is just as important: hand-written assembly often exports
+    its entry points as `STT_NOTYPE` with no size at all. Unity's NEON vertex
+    and matrix routines are exactly that -- `_MultiplyMatrices4x4_NEON` and
+    its neighbours -- and the sprite renderer reaches them through function
+    pointers, so neither `.eh_frame` nor call-site recovery can find them.
+    They come back with extent zero here; `add_init_array_starts` gives them
+    the tail up to the next known start, the same way it does for constructors.
     """
     out = []
+    executable = set()
+    for index, section in enumerate(elf.iter_sections()):
+        if section["sh_flags"] & 0x4 and section["sh_type"] != "SHT_NOBITS":
+            executable.add(index)
     for name in (".symtab", ".dynsym"):
         section = elf.get_section_by_name(name)
         if section is None:
             continue
         for sym in section.iter_symbols():
-            if sym["st_info"]["type"] != "STT_FUNC":
+            kind = sym["st_info"]["type"]
+            if kind not in ("STT_FUNC", "STT_NOTYPE"):
                 continue
             # An undefined symbol is an import, and a size of zero says the
             # linker did not know the extent -- neither can be lifted.
             if sym["st_shndx"] == "SHN_UNDEF":
                 continue
             start, size = sym["st_value"], sym["st_size"]
-            if start and size:
-                # Thumb-style low-bit tagging does not apply to aarch64, but a
-                # misaligned start would desynchronise the disassembler.
-                if start % 4 == 0:
+            if not start or start % 4 != 0:
+                continue
+            if kind == "STT_FUNC":
+                if size:
                     out.append((start, size))
+                continue
+            # A global/weak NOTYPE symbol in an executable section is an
+            # assembly entry point. Local NOTYPE symbols are ordinary labels:
+            # they are already reached as branch targets inside the function
+            # that owns them. Linker boundary markers are not code at all.
+            if sym["st_info"]["bind"] not in ("STB_GLOBAL", "STB_WEAK"):
+                continue
+            if not isinstance(sym["st_shndx"], int) or sym["st_shndx"] not in executable:
+                continue
+            if sym.name.startswith(("__start_", "__stop_")):
+                continue
+            out.append((start, 0))
     out.sort()
     return out
 
@@ -2583,6 +2950,78 @@ def plt_symbols(elf: ELFFile) -> dict[int, str]:
             continue
         out[base + 32 + index * 16] = dynsym.get_symbol(symbol).name
     return out
+
+
+def functions_from_init_array(elf: ELFFile) -> list[int]:
+    """The addresses named by `.init_array` and `.preinit_array`.
+
+    Android fills these arrays with relocations, so their file bytes are zero
+    and an ordinary section read says nothing. The relocations are the real
+    contents: each entry is a pointer to a constructor, and a constructor is a
+    function start whether or not `.eh_frame` happened to describe it. Leaving
+    one out does not fail at load time -- it fails much later, when the host
+    calls the address and the dispatcher has never heard of it.
+    """
+    out: list[int] = []
+    for sec in elf.iter_sections():
+        if sec["sh_type"] not in ("SHT_INIT_ARRAY", "SHT_PREINIT_ARRAY"):
+            continue
+        base = sec["sh_addr"]
+        end = base + sec["sh_size"]
+        seen: dict[int, int] = {}
+        for relname in (".rela.dyn", ".rela.plt"):
+            rel = elf.get_section_by_name(relname)
+            if rel is None or rel["sh_type"] != "SHT_RELA":
+                continue
+            for r in rel.iter_relocations():
+                if base <= r["r_offset"] < end and r["r_addend"]:
+                    seen[r["r_offset"]] = int(r["r_addend"])
+        data = sec.data() if sec["sh_type"] != "SHT_NOBITS" else b""
+        for i in range(0, len(data) - 7, 8):
+            addr = seen.get(base + i)
+            if addr is None:
+                addr = int.from_bytes(data[i:i + 8], "little")
+            if addr:
+                out.append(addr)
+    return sorted(set(out))
+
+
+def add_init_array_starts(elf: ELFFile, funcs: list[tuple[int, int]]
+                          ) -> list[tuple[int, int]]:
+    """Give every constructor an explicit extent.
+
+    An array entry can point into the middle of an extent recovered from an
+    unwind entry or a call site -- the two functions are adjacent, and the
+    earlier function's range was taken to run to the next known start. The
+    constructor still needs its own dispatcher key, so its extent is the tail
+    of that range up to the next known start.
+    """
+    targets = set(functions_from_init_array(elf))
+    # A zero-sized symbol is a start too, but not an extent: assembly entry
+    # points come out of `functions_from_symbols` that way. Both kinds need the
+    # same tail, so they are collected together and the zero-sized entries are
+    # replaced rather than duplicated.
+    targets.update(addr for addr, size in funcs if not size)
+    if not targets:
+        return funcs
+    known = {addr: size for addr, size in funcs if size}
+    starts = sorted(set(known) | targets)
+    sections = code_sections(elf)
+    out = [(addr, size) for addr, size in funcs if size]
+    for target in targets:
+        if known.get(target):
+            continue
+        span = next(((a, a + len(b)) for a, b in sections
+                     if a <= target < a + len(b)), None)
+        if span is None:
+            continue
+        j = bisect.bisect_right(starts, target)
+        end = starts[j] if j < len(starts) else span[1]
+        end = min(end, span[1], target + RECOVER_MAX)
+        if end > target:
+            out.append((target, end - target))
+            known[target] = end - target
+    return sorted(out)
 
 
 def functions_from_eh_frame(elf: ELFFile) -> list[tuple[int, int]]:
@@ -2715,6 +3154,8 @@ def emit_program(lifter: Lifter, images, out_dir: str, shards: int,
                     continue
                 handles[written % shards].write(code + "\n")
                 written += 1
+                if written % 5000 == 0:
+                    print(f"  ... {written:,} functions written", flush=True)
             if limit and done >= limit:
                 break
             # Whatever is still referenced and undefined is a function that no
@@ -2802,7 +3243,13 @@ def emit_program(lifter: Lifter, images, out_dir: str, shards: int,
       else hi = mid;
     }
     if (lo < kTables[im].count && items[lo].offset == off) {
+      // A lifted function computes every PC-relative address from its own
+      // image's base, so the base has to follow the call. Nested calls switch
+      // it again on the way in and restore it on the way out.
+      const uint64_t saved_base = c->image_base;
+      c->image_base = base;
       items[lo].fn(c);
+      c->image_base = saved_base;
       return;
     }
     break;  // inside this image, but not at a function we lifted
@@ -2844,10 +3291,11 @@ def main() -> None:
     for lib in args.library:
         with open(lib, "rb") as fh:
             elf = ELFFile(fh)
+            funcs = dedupe_starts(functions_from_eh_frame(elf),
+                                  functions_from_plt(elf),
+                                  functions_from_symbols(elf))
             images.append((os.path.basename(lib),
-                           dedupe_starts(functions_from_eh_frame(elf),
-                                         functions_from_plt(elf),
-                                         functions_from_symbols(elf)),
+                           add_init_array_starts(elf, funcs),
                            code_sections(elf),
                            data_sections(elf),
                            plt_symbols(elf)))

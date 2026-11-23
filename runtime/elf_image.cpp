@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 
@@ -67,8 +68,9 @@ constexpr int64_t DT_NEEDED = 1, DT_PLTRELSZ = 2, DT_HASH = 4, DT_STRTAB = 5,
 
 // The only four relocation types this image uses. Anything else is a surprise
 // and is reported rather than silently skipped.
-constexpr uint32_t R_AARCH64_ABS64 = 257, R_AARCH64_GLOB_DAT = 1025,
-                   R_AARCH64_JUMP_SLOT = 1026, R_AARCH64_RELATIVE = 1027;
+constexpr uint32_t R_AARCH64_NONE = 0, R_AARCH64_ABS64 = 257,
+                   R_AARCH64_GLOB_DAT = 1025, R_AARCH64_JUMP_SLOT = 1026,
+                   R_AARCH64_RELATIVE = 1027;
 
 constexpr uint16_t SHN_UNDEF = 0;
 constexpr uint64_t kPageSize = 4096;
@@ -124,6 +126,10 @@ bool SetProtection(void* addr, size_t bytes, uint32_t flags) {
 }  // namespace
 
 ElfImage::~ElfImage() {
+  if (getenv("ARC_TRACE_IMAGE_MAP"))
+    fprintf(stderr, "[unmap] %s base=%p span=%#llx\n", name_.c_str(), base_,
+            static_cast<unsigned long long>(span_));
+  if (getenv("ARC_KEEP_IMAGES")) return;
   Unmap(base_, span_);
   Unmap(traps_, kPageSize);
 }
@@ -211,6 +217,8 @@ bool ElfImage::Load(const std::string& path, const Resolver& resolve,
 
   std::ifstream f(path, std::ios::binary);
   if (!f) return fail("cannot open file");
+  const size_t slash = path.find_last_of("/\\");
+  name_ = slash == std::string::npos ? path : path.substr(slash + 1);
   std::vector<uint8_t> file((std::istreambuf_iterator<char>(f)),
                             std::istreambuf_iterator<char>());
   if (file.size() < sizeof(Ehdr)) return fail("truncated");
@@ -238,6 +246,8 @@ bool ElfImage::Load(const std::string& path, const Resolver& resolve,
   if (!base_) return fail("cannot reserve image memory");
   traps_ = static_cast<uint8_t*>(MapGuard(kPageSize));
   if (!traps_) return fail("cannot reserve trap page");
+  if (getenv("ARC_TRACE_TRAPS"))
+    fprintf(stderr, "traps %s %p\n", name_.c_str(), traps_);
 
   for (uint16_t i = 0; i < eh->phnum; ++i) {
     if (ph[i].type != PT_LOAD) continue;
@@ -315,6 +325,10 @@ bool ElfImage::Load(const std::string& path, const Resolver& resolve,
       uint32_t sym = static_cast<uint32_t>(r->info >> 32);
       uint64_t* slot = reinterpret_cast<uint64_t*>(base_ + r->offset);
       switch (type) {
+        case R_AARCH64_NONE:
+          // Padding entries are legal and carry no work. Unity's libil2cpp
+          // ships ~68k of them in .rela.dyn.
+          break;
         case R_AARCH64_RELATIVE:
           *slot = reinterpret_cast<uint64_t>(base_) + r->addend;
           break;
@@ -339,7 +353,15 @@ bool ElfImage::Load(const std::string& path, const Resolver& resolve,
 
   if (init_arr) {
     const uint64_t* ia = reinterpret_cast<const uint64_t*>(base_ + init_arr);
-    for (uint64_t i = 0; i < init_sz / 8; ++i) init_array_.push_back(ia[i]);
+    for (uint64_t i = 0; i < init_sz / 8; ++i) {
+      // A slot with no relocation is not a constructor. Android's linker
+      // iterates the table but cannot call address zero, and shipped images
+      // do contain padded zero slots -- libc++_shared has one real entry and
+      // one zero, libms has only the zero. Keeping them makes every boot
+      // report a fault at "-image_base", which is exactly what the slot
+      // looks like once the image base is subtracted.
+      if (ia[i]) init_array_.push_back(ia[i]);
+    }
   }
   return true;
 }
@@ -397,6 +419,48 @@ bool ElfImage::Protect(std::string* err) {
       return false;
     }
   }
+  return true;
+}
+
+bool ElfImage::Patch(uint64_t offset, const void* bytes, size_t length,
+                     std::string* err) {
+  if (!base_ || !bytes || !length) {
+    if (err) *err = "empty patch";
+    return false;
+  }
+  const uint64_t end = offset + length;
+  bool covered = false;
+  for (const Segment& s : segments_)
+    if (offset >= s.vaddr && end <= s.vaddr + s.memsz) covered = true;
+  if (!covered) {
+    if (err) *err = "patch lies outside every segment";
+    return false;
+  }
+  uint8_t* at = base_ + offset;
+#if defined(_WIN32)
+  DWORD previous = 0;
+  if (!VirtualProtect(at, length, PAGE_EXECUTE_READWRITE, &previous)) {
+    if (err) *err = "cannot make the patch target writable";
+    return false;
+  }
+  memcpy(at, bytes, length);
+  FlushInstructionCache(GetCurrentProcess(), at, length);
+  DWORD ignored = 0;
+  VirtualProtect(at, length, previous, &ignored);
+#else
+  const uintptr_t page = reinterpret_cast<uintptr_t>(at) & ~(kPageSize - 1);
+  const size_t span = static_cast<size_t>(
+      RoundUp(reinterpret_cast<uintptr_t>(at) + length, kPageSize) - page);
+  if (mprotect(reinterpret_cast<void*>(page), span,
+               PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    if (err) *err = "cannot make the patch target writable";
+    return false;
+  }
+  memcpy(at, bytes, length);
+  __builtin___clear_cache(reinterpret_cast<char*>(at),
+                          reinterpret_cast<char*>(at + length));
+  mprotect(reinterpret_cast<void*>(page), span, PROT_READ | PROT_EXEC);
+#endif
   return true;
 }
 

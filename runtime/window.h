@@ -44,8 +44,24 @@ class Window {
   // One queued touch, oldest first. False when there are none left.
   bool NextPointer(Pointer* out);
 
-  void Present();
+  // Presents the back buffer. Returns false when the window is occluded or
+  // minimised and the swap was deliberately skipped: the frame still ran, but
+  // there was nothing to show. A compositor that has no visible surface can
+  // block the swap for tens of seconds, which stalls the message pump and makes
+  // the window report "Not Responding"; the guest does not need to wait for it.
+  bool Present();
   void Close();
+
+  // True when no part of the client area is exposed (covered, minimised,
+  // cloaked, or zero-sized). Probes five points with `WindowFromPoint` and a
+  // DWM query, so callers should treat it as a slow check; the swap path
+  // samples it on a cadence instead of every frame.
+  bool Occluded() const;
+
+  // Set the title bar text. Cheap enough to call once a second, and the least
+  // intrusive place to show live status: no draw call, no overlay, no change
+  // to the guest's rendering, and it survives a stalled frame.
+  void SetTitle(const char* title);
 
   // Hand the context to the calling thread, and give it up again.
   //
@@ -69,8 +85,14 @@ class Window {
   std::string Describe() const;
 
  private:
+  // Submit the frame's GL commands without waiting for them. Used when the
+  // swap is skipped so the driver's command queue cannot grow without bound.
+  void FlushGl();
+  bool SkipPresent() const;
+
   void* window_ = nullptr;
   void* context_ = nullptr;
+  void* hwnd_ = nullptr;
   int width_ = 0;
   int height_ = 0;
   bool resized_ = false;
@@ -94,6 +116,15 @@ class Window {
   int wheel_pending_ = 0;  // signed pixels still to drag
   int wheel_x_ = 0, wheel_y_ = 0;
   bool wheel_active_ = false;  // a synthetic finger is currently down
+
+  // Occlusion changes when the user raises or covers a window, not once per
+  // frame. Probing it every frame costs five `WindowFromPoint` calls and a DWM
+  // round trip, which showed up as a steady share of the render loop, and the
+  // answer flapping with whichever window had focus made presents stutter.
+  // Sample every eighth frame instead: a transition is still caught inside a
+  // frame or two of wall time at any sane rate.
+  mutable int occl_ticks_ = 0;
+  mutable bool occl_cached_ = false;
 };
 
 }  // namespace arc

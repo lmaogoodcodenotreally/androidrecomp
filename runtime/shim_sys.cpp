@@ -20,21 +20,29 @@
 // paths are not taken, not to pretend the behaviour was reproduced.
 
 #include <cerrno>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
 #include <cstring>
+#include <ctime>
+#include "arm64_context.h"
+#include <map>
+#include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include "arm64_context.h"
+#include "arc_signal.h"
 #include "elf_image.h"
 #include "shim.h"
 
 #if defined(_WIN32)
+#include <io.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -199,16 +207,91 @@ void SockaddrToGuest(void* addr, uint32_t len) {
   memcpy(addr, &family, sizeof family);
 }
 
+// Guest descriptor numbers for sockets, on the host where a socket is not a
+// descriptor.
+//
+// On Android a socket *is* a file descriptor: a small number, unique against
+// open files, and usable anywhere a descriptor is -- in an fd_set, in poll,
+// in dup2. On Windows a SOCKET is an opaque handle from a different namespace,
+// and its value is large (a few thousand, once a few hundred have been
+// opened). Handing that value to the guest looks harmless until the guest
+// fills in an fd_set: a Bionic fd_set is a 1024-bit mask indexed by descriptor,
+// so FD_SET(1344) writes past the end of the caller's mask and select() is
+// told that nothing is being waited on. The connection then never completes,
+// the HTTP stack times out, and the title reports that it has no network --
+// with the connection actually open the whole time.
+//
+// So the number the guest sees is ours: a small one from a range the CRT will
+// not hand out for files, mapped to the host socket. Every socket entry point
+// translates on the way in, select translates both ways, and the file layer
+// asks whether a descriptor is a socket instead of guessing from its value.
+constexpr int kGuestSocketFirst = 512;
+constexpr int kGuestSocketLast = 1023;
+
+std::mutex g_socket_map_lock;
+std::map<int, SOCKET> g_guest_to_host;
+std::map<SOCKET, int> g_host_to_guest;
+int g_next_guest_socket = kGuestSocketFirst;
+
+// The guest's number for this host socket, allocating one if it has none.
+int GuestSocketFor(SOCKET host) {
+  std::lock_guard<std::mutex> held(g_socket_map_lock);
+  const auto known = g_host_to_guest.find(host);
+  if (known != g_host_to_guest.end()) return known->second;
+  for (int fd = g_next_guest_socket; fd < kGuestSocketLast; ++fd) {
+    if (g_guest_to_host.count(fd)) continue;
+    g_guest_to_host[fd] = host;
+    g_host_to_guest[host] = fd;
+    g_next_guest_socket = fd + 1;
+    return fd;
+  }
+  return -1;
+}
+
+// The host socket behind a guest descriptor. A descriptor that is not in the
+// table is passed through as it is: a socket the guest obtained some other way
+// is still a host socket, and that is the only interpretation that keeps
+// working for paths this shim does not know about.
+SOCKET HostSocketFor(int fd) {
+  std::lock_guard<std::mutex> held(g_socket_map_lock);
+  const auto it = g_guest_to_host.find(fd);
+  return it == g_guest_to_host.end() ? static_cast<SOCKET>(fd) : it->second;
+}
+
+bool TracingNet();
+
 int Socket(int domain, int type, int protocol) {
   EnsureWinsock();
-  const int fd = static_cast<int>(::socket(FamilyToHost(domain), type, protocol));
-  if (fd < 0) ShimNetErrno();
+  // Bionic's socket() takes SOCK_NONBLOCK and SOCK_CLOEXEC in the type, which
+  // Winsock rejects outright -- and a caller that asks for them gets a plain
+  // "Error" back from curl, not a socket. They are bits, not socket kinds, so
+  // the kind is the low nibble and the flags are applied afterwards.
+  const int kind = type & 0xf;
+  const bool nonblock = (type & 0x800) != 0;
+  const SOCKET host = ::socket(FamilyToHost(domain), kind, protocol);
+  if (host == INVALID_SOCKET) {
+    if (TracingNet())
+      fprintf(stderr, "[net] socket(domain=%d type=%#x proto=%d) failed wsa=%d\n",
+              domain, type, protocol, ::WSAGetLastError());
+    ShimNetErrno();
+    return -1;
+  }
+  if (nonblock) {
+    u_long on = 1;
+    ::ioctlsocket(host, FIONBIO, &on);
+  }
+  const int fd = GuestSocketFor(host);
+  if (fd < 0) {
+    ::closesocket(host);
+    errno = EMFILE;
+    return -1;
+  }
   return fd;
 }
 int Bind(int fd, const void* addr, uint32_t len) {
   HostSockaddr host;
   if (!ToHostSockaddr(addr, len, &host)) return -1;
-  return ::bind(fd, host.get(), static_cast<int>(len));
+  return ::bind(HostSocketFor(fd), host.get(), static_cast<int>(len));
 }
 // What actually happened on a socket, which none of the callers report. A
 // connection that is opened and then never written to, or written to and never
@@ -348,11 +431,28 @@ bool IsLoopback(const sockaddr* sa) {
   return (ntohl(in->sin_addr.s_addr) >> 24) == 127;
 }
 
+bool TlsRedirectAllowed() {
+  static const bool allow = getenv("ARC_REDIRECT_TLS") != nullptr;
+  return allow;
+}
+
 bool ShouldRedirect(const sockaddr* to, const sockaddr_in& target) {
-  if (IsLoopback(to)) return false;
   if (!to || to->sa_family != AF_INET) return false;
   const auto* in = reinterpret_cast<const sockaddr_in*>(to);
-  if (ntohs(in->sin_port) == kTlsPort && ntohs(target.sin_port) != kTlsPort)
+  // Already the sidecar, address and port both. Anything else that happens to
+  // be loopback is not: a title that resolves its server to 127.0.0.1 because
+  // this host answered the lookup keeps its own port, and the sidecar never
+  // listens there. Leaving that alone is how the connection goes to a closed
+  // port on the right machine instead of the right port on it.
+  if (in->sin_addr.s_addr == target.sin_addr.s_addr &&
+      in->sin_port == target.sin_port)
+    return false;
+  // A 443 destination normally means "reachability check", which a plaintext
+  // sidecar cannot answer. A sidecar that itself terminates TLS is a different
+  // case, and the title's own API is on 443 too, so the port mismatch is only
+  // refused unless the port explicitly says its target speaks TLS.
+  if (ntohs(in->sin_port) == kTlsPort && ntohs(target.sin_port) != kTlsPort &&
+      !TlsRedirectAllowed())
     return false;
   return true;
 }
@@ -380,21 +480,42 @@ int Connect(int fd, const void* addr, uint32_t len) {
     errno = kGuestEInval;
     return -1;
   }
+  const SOCKET socket = HostSocketFor(fd);
   sockaddr_in target{};
   if (RedirectTarget(&target) && ShouldRedirect(host.get(), target)) {
-    const int rc = ::connect(fd, reinterpret_cast<const sockaddr*>(&target),
+    const int rc = ::connect(socket, reinterpret_cast<const sockaddr*>(&target),
                              static_cast<int>(sizeof target));
     return ConnectResult(fd, reinterpret_cast<const sockaddr*>(&target), rc,
                          "connect(redirected)");
   }
-  const int rc = ::connect(fd, host.get(), static_cast<int>(len));
+  const int rc = ::connect(socket, host.get(), static_cast<int>(len));
   return ConnectResult(fd, host.get(), rc, "connect");
 }
-int Listen(int fd, int backlog) { return ::listen(fd, backlog); }
+int Listen(int fd, int backlog) { return ::listen(HostSocketFor(fd), backlog); }
 int Accept(int fd, void* addr, uint32_t* len) {
-  return static_cast<int>(
-      ::accept(fd, static_cast<sockaddr*>(addr),
-               reinterpret_cast<socklen_t*>(len)));
+  sockaddr_storage from{};
+  socklen_t from_len = sizeof from;
+  const SOCKET accepted =
+      ::accept(HostSocketFor(fd), reinterpret_cast<sockaddr*>(&from), &from_len);
+  if (accepted == INVALID_SOCKET) {
+    ShimNetErrno();
+    return -1;
+  }
+  const int guest = GuestSocketFor(accepted);
+  if (guest < 0) {
+    ::closesocket(accepted);
+    errno = EMFILE;
+    return -1;
+  }
+  // The address goes back in the guest's numbering, as recvfrom's does.
+  if (addr && len) {
+    const uint32_t room = *len;
+    const uint32_t take = room < from_len ? room : static_cast<uint32_t>(from_len);
+    memcpy(addr, &from, take);
+    *len = take;
+    SockaddrToGuest(addr, take);
+  }
+  return guest;
 }
 // Bionic's MSG_* bits, from the Linux headers. Only the low three agree with
 // Winsock's, and the rest are not merely ignored -- Winsock rejects a flag it
@@ -426,7 +547,7 @@ int MsgFlagsToHost(int flags) {
 }
 
 int64_t Send(int fd, const void* buf, uint64_t n, int flags) {
-  const int64_t rc = ::send(fd, static_cast<const char*>(buf),
+  const int64_t rc = ::send(HostSocketFor(fd), static_cast<const char*>(buf),
                             static_cast<int>(n), MsgFlagsToHost(flags));
   if (rc < 0) ShimNetErrno();
   TraceIo("send", fd, static_cast<int64_t>(n), rc);
@@ -434,8 +555,8 @@ int64_t Send(int fd, const void* buf, uint64_t n, int flags) {
   return rc;
 }
 int64_t Recv(int fd, void* buf, uint64_t n, int flags) {
-  const int64_t rc = ::recv(fd, static_cast<char*>(buf), static_cast<int>(n),
-                            MsgFlagsToHost(flags));
+  const int64_t rc = ::recv(HostSocketFor(fd), static_cast<char*>(buf),
+                            static_cast<int>(n), MsgFlagsToHost(flags));
   if (rc < 0) ShimNetErrno();
   TraceIo("recv", fd, static_cast<int64_t>(n), rc);
   TraceBody("recv", buf, rc);
@@ -448,8 +569,9 @@ int64_t Sendto(int fd, const void* buf, uint64_t n, int flags,
   HostSockaddr host;
   const bool have = addr && ToHostSockaddr(addr, len, &host);
   const int64_t rc =
-      ::sendto(fd, static_cast<const char*>(buf), static_cast<int>(n),
-               MsgFlagsToHost(flags), have ? host.get() : nullptr,
+      ::sendto(HostSocketFor(fd), static_cast<const char*>(buf),
+               static_cast<int>(n), MsgFlagsToHost(flags),
+               have ? host.get() : nullptr,
                have ? static_cast<int>(len) : 0);
   if (rc < 0) ShimNetErrno();
   TraceIo("sendto", fd, static_cast<int64_t>(n), rc);
@@ -458,8 +580,9 @@ int64_t Sendto(int fd, const void* buf, uint64_t n, int flags,
 int64_t Recvfrom(int fd, void* buf, uint64_t n, int flags, void* addr,
                  uint32_t* len) {
   const int64_t rc =
-      ::recvfrom(fd, static_cast<char*>(buf), static_cast<int>(n),
-                 MsgFlagsToHost(flags), static_cast<sockaddr*>(addr),
+      ::recvfrom(HostSocketFor(fd), static_cast<char*>(buf),
+                 static_cast<int>(n), MsgFlagsToHost(flags),
+                 static_cast<sockaddr*>(addr),
                  reinterpret_cast<socklen_t*>(len));
   if (rc < 0) ShimNetErrno();
   // The family goes back in the guest's numbering, as it does from accept.
@@ -467,10 +590,11 @@ int64_t Recvfrom(int fd, void* buf, uint64_t n, int flags, void* addr,
   TraceIo("recvfrom", fd, static_cast<int64_t>(n), rc);
   return rc;
 }
-int Shutdown(int fd, int how) { return ::shutdown(fd, how); }
+int Shutdown(int fd, int how) { return ::shutdown(HostSocketFor(fd), how); }
 int Setsockopt(int fd, int level, int name, const void* val, uint32_t len) {
   const int host_level = TranslateSockLevel(level);
   const int host_name = TranslateSockopt(level, name);
+  const SOCKET socket = HostSocketFor(fd);
 #if defined(_WIN32)
   // Two options carry a payload that differs as well as a number. Both are set
   // by every HTTP stack, and both fail the call outright if forwarded as-is.
@@ -482,24 +606,24 @@ int Setsockopt(int fd, int level, int name, const void* val, uint32_t len) {
     int64_t tv[2] = {0, 0};
     memcpy(tv, val, sizeof tv);
     const DWORD ms = static_cast<DWORD>(tv[0] * 1000 + tv[1] / 1000);
-    return ::setsockopt(fd, host_level, host_name,
+    return ::setsockopt(socket, host_level, host_name,
                         reinterpret_cast<const char*>(&ms), sizeof ms);
   }
   if (host_level == SOL_SOCKET && host_name == SO_LINGER && val && len >= 8) {
     int32_t guest[2] = {0, 0};
     memcpy(guest, val, sizeof guest);
     ::linger host{static_cast<u_short>(guest[0]), static_cast<u_short>(guest[1])};
-    return ::setsockopt(fd, host_level, host_name,
+    return ::setsockopt(socket, host_level, host_name,
                         reinterpret_cast<const char*>(&host), sizeof host);
   }
 #endif
-  return ::setsockopt(fd, host_level, host_name,
+  return ::setsockopt(socket, host_level, host_name,
                       static_cast<const char*>(val), len);
 }
 int Getsockopt(int fd, int level, int name, void* val, uint32_t* len) {
   const int host_level = TranslateSockLevel(level);
   const int host_name = TranslateSockopt(level, name);
-  const int rc = ::getsockopt(fd, host_level, host_name,
+  const int rc = ::getsockopt(HostSocketFor(fd), host_level, host_name,
                               static_cast<char*>(val),
                               reinterpret_cast<socklen_t*>(len));
   if (TracingNet()) {
@@ -510,11 +634,11 @@ int Getsockopt(int fd, int level, int name, void* val, uint32_t* len) {
   return rc;
 }
 int Getsockname(int fd, void* addr, uint32_t* len) {
-  return ::getsockname(fd, static_cast<sockaddr*>(addr),
+  return ::getsockname(HostSocketFor(fd), static_cast<sockaddr*>(addr),
                        reinterpret_cast<socklen_t*>(len));
 }
 int Getpeername(int fd, void* addr, uint32_t* len) {
-  return ::getpeername(fd, static_cast<sockaddr*>(addr),
+  return ::getpeername(HostSocketFor(fd), static_cast<sockaddr*>(addr),
                        reinterpret_cast<socklen_t*>(len));
 }
 int Gethostname(char* name, uint64_t len) {
@@ -523,15 +647,16 @@ int Gethostname(char* name, uint64_t len) {
 }
 #if defined(_WIN32)
 // A Linux fd_set is a bitmask indexed by descriptor; Winsock's is a count and
-// an array. Translated both ways, because a caller reads back which of its
-// descriptors are ready.
+// an array of SOCKETs. Translated both ways, because a caller reads back which
+// of its descriptors are ready -- and the descriptors in that mask are the
+// guest's small numbers, not the host handles behind them.
 void GuestFdsToHost(const void* guest, int nfds, fd_set* host) {
   FD_ZERO(host);
   if (!guest) return;
   const auto* bits = static_cast<const uint64_t*>(guest);
   for (int fd = 0; fd < nfds && fd < 1024; ++fd)
     if (bits[fd / 64] & (uint64_t{1} << (fd % 64)))
-      FD_SET(static_cast<SOCKET>(fd), host);
+      FD_SET(HostSocketFor(fd), host);
 }
 
 void HostFdsToGuest(const fd_set* host, void* guest, int nfds) {
@@ -539,8 +664,9 @@ void HostFdsToGuest(const fd_set* host, void* guest, int nfds) {
   auto* bits = static_cast<uint64_t*>(guest);
   for (int i = 0; i < (nfds + 63) / 64 && i < 16; ++i) bits[i] = 0;
   for (u_int i = 0; i < host->fd_count; ++i) {
-    const uint64_t fd = static_cast<uint64_t>(host->fd_array[i]);
-    if (fd < 1024) bits[fd / 64] |= uint64_t{1} << (fd % 64);
+    int fd = ShimGuestSocket(host->fd_array[i]);
+    if (fd < 0) fd = static_cast<int>(host->fd_array[i]);
+    if (fd >= 0 && fd < 1024) bits[fd / 64] |= uint64_t{1} << (fd % 64);
   }
 }
 #endif
@@ -552,13 +678,46 @@ int Select(int n, void* r, void* w, void* e, void* timeout) {
   GuestFdsToHost(r, n, &hr);
   GuestFdsToHost(w, n, &hw);
   GuestFdsToHost(e, n, &he);
-  const int rc = ::select(n, r ? &hr : nullptr, w ? &hw : nullptr,
-                          e ? &he : nullptr, static_cast<timeval*>(timeout));
+  // A Bionic `struct timeval` is two 64-bit fields; Winsock's is two 32-bit
+  // ones. Forwarded as it is, the timeout is read out of the middle of the
+  // guest's struct -- so a sub-second wait becomes a full second and a
+  // one-second wait becomes whatever follows it on the stack.
+  timeval host_timeout{};
+  timeval* timeout_arg = nullptr;
+  if (timeout) {
+    int64_t tv[2] = {0, 0};
+    memcpy(tv, timeout, sizeof tv);
+    host_timeout.tv_sec = static_cast<long>(tv[0]);
+    host_timeout.tv_usec = static_cast<long>(tv[1]);
+    timeout_arg = &host_timeout;
+  }
+  int rc;
+  const auto started = std::chrono::steady_clock::now();
+  if (hr.fd_count == 0 && hw.fd_count == 0 && he.fd_count == 0) {
+    // Nothing to wait on. Winsock rejects that outright (WSAEINVAL); POSIX
+    // treats it as a plain sleep, and callers use it as one.
+    const int64_t micros =
+        timeout_arg ? static_cast<int64_t>(host_timeout.tv_sec) * 1000000 +
+                          host_timeout.tv_usec
+                    : 1000;
+    if (micros > 0)
+      std::this_thread::sleep_for(std::chrono::microseconds(micros));
+    rc = 0;
+  } else {
+    rc = ::select(n, r ? &hr : nullptr, w ? &hw : nullptr,
+                  e ? &he : nullptr,
+                  timeout_arg);
+    if (rc < 0) ShimNetErrno();
+  }
   if (TracingNet()) {
     KeepErrno keep;
-    fprintf(stderr, "[net] select n=%d r=%u w=%u e=%u -> rc=%d\n", n,
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    fprintf(stderr,
+            "[net] select n=%d r=%u w=%u e=%u -> rc=%d in %lldms\n", n,
             r ? hr.fd_count : 0u, w ? hw.fd_count : 0u, e ? he.fd_count : 0u,
-            rc);
+            rc, static_cast<long long>(elapsed));
   }
   if (r) HostFdsToGuest(&hr, r, n);
   if (w) HostFdsToGuest(&hw, w, n);
@@ -660,8 +819,8 @@ int Getaddrinfo(const char* node, const char* service, const void* hints_in,
   {
     sockaddr_in target{};
     const int port = service ? atoi(service) : 0;
-    if (node && RedirectTarget(&target) && port != kTlsPort &&
-        !IsLoopbackName(node)) {
+    if (node && RedirectTarget(&target) &&
+        (port != kTlsPort || TlsRedirectAllowed()) && !IsLoopbackName(node)) {
       *out = OneAddress(target, hints_ptr);
       if (TracingNet())
         fprintf(stderr, "[net] getaddrinfo(%s, %s) answered with the redirect "
@@ -723,7 +882,54 @@ int Getnameinfo(const void*, uint32_t, char* host, uint32_t hostlen, char* serv,
   if (serv && servlen) serv[0] = '\0';
   return 0;
 }
-void* Gethostbyname(const char*) { return nullptr; }
+// The IPv4-only entry point older socket layers still use; libunity imports it
+// as well as getaddrinfo, and the two do not share an answer. A name whose
+// connection is going to be redirected does not need resolving here either, and
+// returning null for it is not a neutral answer: the caller reads it as "cannot
+// resolve destination host" and abandons the transfer before connect ever runs.
+// LP64 puts the same 8-byte pointers and 4-byte ints on both sides of the shim,
+// so the hostent is built in the shape the guest reads directly.
+struct GuestHostent {
+  char* h_name;
+  char** h_aliases;
+  int32_t h_addrtype;
+  int32_t h_length;
+  char** h_addr_list;
+};
+
+void* Gethostbyname(const char* name) {
+  EnsureWinsock();
+  sockaddr_in target{};
+  if (name && RedirectTarget(&target) && !IsLoopbackName(name)) {
+    static thread_local GuestHostent ent;
+    static thread_local char text[256];
+    static thread_local in_addr addr;
+    static thread_local char* list[2];
+    static thread_local char* alias[1];
+    const size_t n = strlen(name);
+    const size_t copy = n < sizeof text - 1 ? n : sizeof text - 1;
+    memcpy(text, name, copy);
+    text[copy] = '\0';
+    addr = target.sin_addr;
+    list[0] = reinterpret_cast<char*>(&addr);
+    list[1] = nullptr;
+    alias[0] = nullptr;
+    ent.h_name = text;
+    ent.h_aliases = alias;
+    ent.h_addrtype = AF_INET;
+    ent.h_length = 4;
+    ent.h_addr_list = list;
+    if (TracingNet())
+      fprintf(stderr,
+              "[net] gethostbyname(%s) answered with the redirect target\n",
+              name);
+    return &ent;
+  }
+  if (TracingNet())
+    fprintf(stderr, "[net] gethostbyname(%s) left to the resolver\n",
+            name ? name : "(null)");
+  return ::gethostbyname(name);
+}
 unsigned IfNametoindex(const char*) { return 0; }
 int Socketpair(int, int, int, int*) { return -1; }
 int64_t Sendfile(int, int, void*, uint64_t) { return -1; }
@@ -771,7 +977,7 @@ int Poll(void* fds_in, unsigned long nfds, int timeout) {
   EnsureWinsock();
   std::vector<WSAPOLLFD> host(nfds);
   for (unsigned long i = 0; i < nfds; ++i) {
-    host[i].fd = static_cast<SOCKET>(fds[i].fd);
+    host[i].fd = HostSocketFor(fds[i].fd);
     short e = 0;
     if (fds[i].events & kGuestPollIn) e |= POLLRDNORM;
     if (fds[i].events & kGuestPollPri) e |= POLLRDBAND;
@@ -779,15 +985,23 @@ int Poll(void* fds_in, unsigned long nfds, int timeout) {
     host[i].events = e;
     host[i].revents = 0;
   }
+  const auto started = std::chrono::steady_clock::now();
   const int rc = ::WSAPoll(host.data(), static_cast<ULONG>(nfds), timeout);
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
   // Only the waits that are asking "is this connect finished yet", which is
   // the one poll a stalled HTTP stack repeats and the one worth seeing. The
-  // readable-data waits are the steady state and would bury it.
-  if (TracingNet() && (host[0].events & POLLWRNORM)) {
+  // readable-data waits are the steady state and would bury it. A wait that
+  // took a noticeable time is printed whatever it asked for: that is the
+  // request a stack is sitting in while nothing happens, and it is invisible
+  // from outside until the call returns.
+  if (TracingNet() && ((host[0].events & POLLWRNORM) || elapsed > 1000)) {
     KeepErrno keep;
-    fprintf(stderr, "[net] poll n=%lu fd=%d ev=%#x t=%d -> rc=%d rev=%#x\n",
+    fprintf(stderr,
+            "[net] poll n=%lu fd=%d ev=%#x t=%d -> rc=%d rev=%#x in %lldms\n",
             nfds, (int)host[0].fd, host[0].events, timeout, rc,
-            host[0].revents);
+            host[0].revents, static_cast<long long>(elapsed));
   }
   for (unsigned long i = 0; i < nfds; ++i) {
     short r = 0;
@@ -806,27 +1020,223 @@ int Poll(void* fds_in, unsigned long nfds, int timeout) {
 int Ioctl(int, unsigned long, ...) { return 0; }
 
 // --- dynamic linking -------------------------------------------------------
-// dlopen returns null: every library the engine needs is already mapped, and a
-// runtime load of an Android system library could not be satisfied anyway.
-// dlsym searches the images we loaded, then the shim, which is what makes a
-// dlsym-based GL or extension probe work.
+// Every guest library is mapped before the program starts, so dlopen does not
+// load anything: it answers with a handle to the image already registered, and
+// dlsym then searches that image and the shim. Returning null here used to be
+// harmless for a single-image boot, but Unity loads libil2cpp by name and
+// treats a null handle as "the scripting backend is missing".
+//
+// Android system libraries have no guest image -- their symbols are the shim's
+// -- so a small list of those names also gets a non-null sentinel and dlsym
+// answers from the host.
+// Wwise is the one native dependency the managed side loads by name at
+// startup, through P/Invoke. Its real library is a 33 MB guest image that
+// would have to be lifted in full to run, and audio is not what this port is
+// for: what the engine needs from it is that loading succeeds and that its
+// calls answer something usable. The integration is SWIG-generated, so its
+// exports return three different shapes -- struct handles, char pointers and
+// status codes -- through one signature, and no single answer is right for all
+// three. This is the loader's fallback for a title that has not described its
+// Wwise at all: nothing, answered as zero. A port that knows the shapes
+// registers `libAkSoundEngine.so` with a resolver and answers each symbol.
+uint64_t AkSoundStub(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                     uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                     uint64_t) {
+  return 0;
+}
 
-void* Dlopen(const char*, int) { return nullptr; }
+// Audio is deliberately not brought up. The integration's LateUpdate runs a
+// long managed render pass whenever IsInitialized says yes; with no real
+// engine behind the stub that pass has nothing to finish against. Answering
+// "not initialized" makes the integration idle instead of spinning.
+uint64_t AkSoundNotInitialized(uint64_t, uint64_t, uint64_t, uint64_t,
+                               uint64_t, uint64_t, uint64_t, uint64_t,
+                               uint64_t, uint64_t, uint64_t, uint64_t) {
+  return 0;
+}
+
+// Optional plugins registered by the port. The handle handed to the guest is
+// the host-side description below, so dlsym can still tell one plugin from
+// another without inventing a numbering scheme the loader would have to share.
+struct PluginStub {
+  std::string name;
+  ArcPluginFn generic = nullptr;
+  std::map<std::string, ArcPluginFn> symbols;
+  ArcPluginResolve resolve = nullptr;
+};
+
+std::mutex g_plugin_lock;
+std::vector<std::unique_ptr<PluginStub>> g_plugins;
+
+void RegisterPlugin(const char* soname, ArcPluginFn generic) {
+  if (!soname || !*soname) return;
+  std::lock_guard<std::mutex> g(g_plugin_lock);
+  for (const auto& p : g_plugins)
+    if (p->name == soname) {
+      p->generic = generic;
+      return;
+    }
+  auto p = std::make_unique<PluginStub>();
+  p->name = soname;
+  p->generic = generic;
+  g_plugins.push_back(std::move(p));
+}
+
+void RegisterPluginSymbol(const char* soname, const char* symbol,
+                          ArcPluginFn fn) {
+  if (!soname || !*soname || !symbol || !*symbol) return;
+  std::lock_guard<std::mutex> g(g_plugin_lock);
+  for (const auto& p : g_plugins)
+    if (p->name == soname) {
+      p->symbols[symbol] = fn;
+      return;
+    }
+  auto p = std::make_unique<PluginStub>();
+  p->name = soname;
+  p->symbols[symbol] = fn;
+  g_plugins.push_back(std::move(p));
+}
+
+PluginStub* FindPlugin(const std::string& base) {
+  std::lock_guard<std::mutex> g(g_plugin_lock);
+  for (const auto& p : g_plugins)
+    if (p->name == base) return p.get();
+  return nullptr;
+}
+
+void RegisterPluginResolver(const char* soname, ArcPluginResolve resolve) {
+  if (!soname || !*soname) return;
+  std::lock_guard<std::mutex> g(g_plugin_lock);
+  for (const auto& p : g_plugins)
+    if (p->name == soname) {
+      p->resolve = resolve;
+      return;
+    }
+  auto p = std::make_unique<PluginStub>();
+  p->name = soname;
+  p->resolve = resolve;
+  g_plugins.push_back(std::move(p));
+}
+
+// One place decides which thunk a plugin's symbol gets: an explicit entry
+// wins, then the resolver sees the name, then the generic entry answers. The
+// order matters -- a resolver that classified a symbol differently from an
+// explicit registration would make the port's table and its code disagree.
+ArcPluginFn PluginAnswer(PluginStub* plugin, const char* symbol) {
+  ArcPluginFn fn = plugin->generic;
+  if (!symbol) return fn;
+  const auto it = plugin->symbols.find(symbol);
+  if (it != plugin->symbols.end()) return it->second;
+  if (plugin->resolve) {
+    if (ArcPluginFn resolved = plugin->resolve(symbol)) return resolved;
+  }
+  return fn;
+}
+
+PluginStub* PluginForHandle(void* handle) {
+  std::lock_guard<std::mutex> g(g_plugin_lock);
+  for (const auto& p : g_plugins)
+    if (reinterpret_cast<void*>(p.get()) == handle) return p.get();
+  return nullptr;
+}
+
+// Loader tracing is a debugging aid, not part of running a title. It used to
+// print unconditionally, and the engine's plugin discovery calls dlsym
+// thousands of times while loading: the formatted writes to a redirected
+// stderr were a visible part of the first-frame stalls.
+bool TraceDynamic() {
+  static const bool on = getenv("ARC_TRACE_DL") != nullptr;
+  return on;
+}
+
+void* Dlopen(const char* name, int) {
+  if (TraceDynamic()) fprintf(stderr, "[dlopen] %s\n", name ? name : "(null)");
+  if (!name) return nullptr;
+  std::string base(name);
+  const size_t slash = base.find_last_of("/\\");
+  if (slash != std::string::npos) base = base.substr(slash + 1);
+  if (base.find("AkSoundEngine") != std::string::npos)
+    return reinterpret_cast<void*>(2);
+  if (PluginStub* plugin = FindPlugin(base)) return plugin;
+  {
+    std::lock_guard<std::mutex> g(g_images_lock);
+    for (const ElfImage* img : g_images)
+      if (img->name() == base) return const_cast<ElfImage*>(img);
+  }
+  static const char* const kSystem[] = {
+      "libEGL.so",      "libGLESv1_CM.so", "libGLESv2.so",
+      "libandroid.so",  "liblog.so",       "libmediandk.so",
+      "libOpenSLES.so", "libz.so",         "libc.so",
+      "libm.so",        "libdl.so",        "libstdc++.so",
+  };
+  for (const char* s : kSystem)
+    if (base == s) return reinterpret_cast<void*>(1);
+  return nullptr;
+}
 int Dlclose(void*) { return 0; }
 const char* Dlerror() { return nullptr; }
 
-void* Dlsym(void*, const char* symbol) {
+void* Dlsym(void* handle, const char* symbol) {
+  if (TraceDynamic())
+    fprintf(stderr, "[dlsym] request %s\n", symbol ? symbol : "(null)");
+  // The AkSoundEngine handle is a sentinel, not an image: every name asked
+  // of it belongs to the Wwise Unity integration, and the integration's
+  // exports are not all prefixed the same way (CSharp_*, Ak*, ...). The
+  // handle is the reliable part. A port that registers the library gets to
+  // answer each symbol itself -- the integration returns strings, struct
+  // handles and status codes through the same signature, and one answer for
+  // all of them is wrong for at least one of them.
+  if (handle == reinterpret_cast<void*>(2) && symbol) {
+    PluginStub* plugin = FindPlugin("libAkSoundEngine.so");
+    uint64_t (*stub)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                     uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                     uint64_t, uint64_t) = &AkSoundStub;
+    if (plugin) {
+      if (ArcPluginFn fn = PluginAnswer(plugin, symbol))
+        stub = fn;
+    } else if (strcmp(symbol, "CSharp_IsInitialized") == 0) {
+      stub = &AkSoundNotInitialized;
+    }
+    void* answer = reinterpret_cast<void*>(
+        ShimHandOut(reinterpret_cast<uint64_t>(stub), symbol));
+    if (TraceDynamic())
+      fprintf(stderr, "[dlsym] %s -> Ak stub %p\n", symbol, answer);
+    return answer;
+  }
+  if (PluginStub* plugin = PluginForHandle(handle)) {
+    ArcPluginFn fn = PluginAnswer(plugin, symbol);
+    if (!fn) {
+      if (TraceDynamic())
+        fprintf(stderr, "[dlsym] %s -> no plugin stub\n",
+                symbol ? symbol : "?");
+      return nullptr;
+    }
+    void* answer = reinterpret_cast<void*>(
+        ShimHandOut(reinterpret_cast<uint64_t>(fn), symbol));
+    if (TraceDynamic())
+      fprintf(stderr, "[dlsym] %s -> %s stub %p\n", symbol ? symbol : "?",
+              plugin->name.c_str(), answer);
+    return answer;
+  }
   {
     std::lock_guard<std::mutex> g(g_images_lock);
     // A guest image's own symbol is guest code, and is deliberately *not*
     // announced as a native: the dispatcher would then call ARM instructions
     // as if they were host ones.
     for (const ElfImage* img : g_images)
-      if (uint64_t a = img->Lookup(symbol)) return reinterpret_cast<void*>(a);
+      if (uint64_t a = img->Lookup(symbol)) {
+        if (TraceDynamic())
+          fprintf(stderr, "[dlsym] %s -> %#llx (%s)\n", symbol,
+                  (unsigned long long)a, img->name().c_str());
+        return reinterpret_cast<void*>(a);
+      }
   }
   // The shim's answer is host code, and the guest will branch straight to it.
-  return reinterpret_cast<void*>(
+  void* answer = reinterpret_cast<void*>(
       ShimHandOut(ShimResolve(symbol), symbol));
+  if (TraceDynamic())
+    fprintf(stderr, "[dlsym] %s -> shim %p\n", symbol, answer);
+  return answer;
 }
 
 // The C++ unwinder walks this to find each image's .eh_frame, so exceptions
@@ -880,8 +1290,49 @@ int Gettid() {
 #endif
 }
 int Geteuid() { return 0; }
-int Getpwuid_r(uint32_t, void*, char*, uint64_t, void** result) {
-  if (result) *result = nullptr;
+
+// Bionic's struct passwd, laid out the way the guest reads it: two pointers,
+// the numeric ids packed into the next eight bytes, then three more pointers.
+// Returning null -- which is what a Windows host would do for a user that does
+// not exist -- is not a harmless answer here. The engine takes the result and
+// reads pw_dir at offset 0x20 without checking it, which turns a missing
+// account into a fault in the middle of startup.
+struct GuestPasswd {
+  char* pw_name;
+  char* pw_passwd;
+  uint32_t pw_uid;
+  uint32_t pw_gid;
+  char* pw_gecos;
+  char* pw_dir;
+  char* pw_shell;
+};
+
+GuestPasswd& PasswdEntry() {
+  static char name[] = "android";
+  static char password[] = "*";
+  static char gecos[] = "Android";
+  static char home[] = "/";
+  static char shell[] = "/system/bin/sh";
+  static GuestPasswd entry = {name, password, 0, 0, gecos, home, shell};
+  return entry;
+}
+
+void* Getpwuid(uint32_t) { return &PasswdEntry(); }
+void* Getpwnam(const char* name) {
+  if (!name || strcmp(name, "android") == 0 || strcmp(name, "root") == 0 ||
+      strcmp(name, "shell") == 0)
+    return &PasswdEntry();
+  return nullptr;
+}
+int Getpwuid_r(uint32_t, void* pwd, char*, uint64_t length, void** result) {
+  if (result) {
+    if (pwd && length >= sizeof(GuestPasswd)) {
+      memcpy(pwd, &PasswdEntry(), sizeof(GuestPasswd));
+      *result = pwd;
+    } else {
+      *result = &PasswdEntry();
+    }
+  }
   return 0;
 }
 // How many cores to admit to.
@@ -924,20 +1375,43 @@ uint64_t Getauxval(uint64_t) { return 0; }
 // there leaves the random generator unseeded, which fails SSL_connect before
 // it writes anything: the connection opens, nothing is ever sent, and the
 // caller reports that it has no internet.
-constexpr int64_t kArm64SysGetrandom = 278;
-
 int64_t Syscall(int64_t number, ...) {
-  if (number == kArm64SysGetrandom) {
-    va_list ap;
-    va_start(ap, number);
-    void* buf = va_arg(ap, void*);
-    const size_t len = va_arg(ap, size_t);
-    va_end(ap);
-    if (!buf) return -1;
-    ShimFillRandom(buf, len);
-    return static_cast<int64_t>(len);
+  if (getenv("ARC_TRACE_SYSCALL")) {
+    Arm64Ctx* c = arc_current_guest_context();
+    fprintf(stderr,
+            "[syscall] n=%lld a1=%#llx a2=%#llx a3=%#llx a4=%#llx "
+            "lr=%#llx sp=%#llx\n",
+            static_cast<long long>(number),
+            c ? (unsigned long long)c->x[1] : 0,
+            c ? (unsigned long long)c->x[2] : 0,
+            c ? (unsigned long long)c->x[3] : 0,
+            c ? (unsigned long long)c->x[4] : 0,
+            c ? (unsigned long long)c->x[30] : 0,
+            c ? (unsigned long long)c->sp : 0);
   }
-  return -1;
+  // The guest reaches this from its PLT: `bl syscall` with the number in x0
+  // and the remaining arguments following the normal AArch64 C convention.
+  // The native thunk always forwards twelve integer arguments, so reading them
+  // here is both possible and complete. Marshal them back into a context and
+  // let the same kernel-side implementation that answers `svc #0` decode the
+  // call. That matters for more than code reuse: a futex wait must actually
+  // block, and the direct-svc path is the one that knows how.
+  va_list ap;
+  va_start(ap, number);
+  Arm64Ctx context = {};
+  for (int i = 0; i < 8; ++i)
+    context.x[i] = va_arg(ap, uint64_t);
+  va_end(ap);
+  context.x[8] = static_cast<uint64_t>(number);
+  const int64_t result = arc_svc(&context);
+  // Bionic's public syscall() wrapper converts a raw negative errno into -1
+  // and sets errno. The guest calls the wrapper, not the raw instruction, so
+  // this is the boundary where that translation belongs.
+  if (result < 0 && result >= -4095) {
+    errno = static_cast<int>(-result);
+    return -1;
+  }
+  return result;
 }
 int Uname(void* buf) {
   // Linux struct utsname: six 65-byte fields. Zeroed is a valid answer.
@@ -994,17 +1468,172 @@ int Statfs(const char*, GuestStatfs* out) {
   return 0;
 }
 
-// epoll is how a Linux program waits on descriptors. A desktop port has no use
-// for the engine's own event loop -- the window owns that -- so these exist to
-// keep the setup path from failing, and a wait times out having seen nothing.
-// ponytail: real readiness if a title ever drives its networking through this.
-int EpollCreate(int) { return 0x7000001; }
-int EpollCreate1(int) { return 0x7000001; }
-int EpollCtl(int, int, int, void*) { return 0; }
-int EpollWait(int, void*, int, int) { return 0; }
+// epoll is how a Linux program waits on descriptors, and a title's own client
+// can be built entirely around it: libcurl's multi interface uses epoll on
+// Linux, and a TLS stack waiting there is invisible to select() and poll()
+// because it never calls either. A wait that answers "nothing is ready"
+// forever is not a benign stub in that case -- the connection is open, the
+// client is waiting for the socket to become writable, and it never stops
+// waiting.
+//
+// So this is a real implementation: a set of watched descriptors per instance,
+// answered by the same poll that answers poll() and select().
+constexpr int kEpollFirst = 0x7000001;
+constexpr int kEpollInstances = 32;
+constexpr uint32_t kEpollIn = 0x001;
+constexpr uint32_t kEpollPri = 0x002;
+constexpr uint32_t kEpollOut = 0x004;
+constexpr uint32_t kEpollErr = 0x008;
+constexpr uint32_t kEpollHup = 0x010;
+constexpr uint32_t kEpollRdhup = 0x2000;
+
+// The guest's `struct epoll_event`. On aarch64 it is naturally aligned, so the
+// four-byte mask is followed by four bytes of padding and then the eight-byte
+// data word -- twelve bytes would be the x86-64 layout, which is packed.
+struct GuestEpollEvent {
+  uint32_t events;
+  uint32_t padding;
+  uint64_t data;
+};
+
+struct EpollInstance {
+  bool open = false;
+  std::map<int, GuestEpollEvent> watched;  // by guest descriptor
+};
+
+std::mutex g_epoll_lock;
+EpollInstance g_epolls[kEpollInstances];
+
+int NewEpoll() {
+  std::lock_guard<std::mutex> held(g_epoll_lock);
+  for (int i = 0; i < kEpollInstances; ++i) {
+    if (g_epolls[i].open) continue;
+    g_epolls[i].open = true;
+    g_epolls[i].watched.clear();
+    return kEpollFirst + i;
+  }
+  errno = EMFILE;
+  return -1;
+}
+
+int EpollCreate(int) { return NewEpoll(); }
+int EpollCreate1(int) { return NewEpoll(); }
+
+int EpollCtl(int epfd, int op, int fd, void* event) {
+  const int index = epfd - kEpollFirst;
+  if (index < 0 || index >= kEpollInstances) {
+    errno = kGuestEInval;
+    return -1;
+  }
+  std::lock_guard<std::mutex> held(g_epoll_lock);
+  EpollInstance& set = g_epolls[index];
+  if (!set.open) {
+    errno = kGuestEInval;
+    return -1;
+  }
+  if (op == 2) {  // EPOLL_CTL_DEL
+    set.watched.erase(fd);
+    return 0;
+  }
+  if (op == 1 || op == 3) {  // ADD, MOD
+    GuestEpollEvent entry{};
+    if (event) memcpy(&entry, event, sizeof entry);
+    entry.padding = 0;
+    set.watched[fd] = entry;
+    return 0;
+  }
+  errno = kGuestEInval;
+  return -1;
+}
+
+int EpollWait(int epfd, void* events, int maxevents, int timeout) {
+  const int index = epfd - kEpollFirst;
+  if (index < 0 || index >= kEpollInstances || maxevents <= 0 || !events) {
+    errno = kGuestEInval;
+    return -1;
+  }
+  // A snapshot: the wait must not hold the lock while it blocks, and another
+  // thread adding a descriptor mid-wait is normal.
+  std::vector<std::pair<int, GuestEpollEvent>> watched;
+  {
+    std::lock_guard<std::mutex> held(g_epoll_lock);
+    if (!g_epolls[index].open) {
+      errno = kGuestEInval;
+      return -1;
+    }
+    watched.assign(g_epolls[index].watched.begin(),
+                   g_epolls[index].watched.end());
+  }
+  if (watched.empty()) {
+    if (timeout > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
+    return 0;
+  }
+  std::vector<WSAPOLLFD> host;
+  std::vector<GuestEpollEvent> wanted;
+  for (const auto& item : watched) {
+    // Only descriptors this host can actually poll. A stand-in handle -- an
+    // eventfd, a pipe the shim never made -- would fail the whole call, and
+    // one unsupported watch is not a reason to refuse to watch the rest.
+    if (!ShimHostSocket(item.first)) continue;
+    WSAPOLLFD poll{};
+    poll.fd = HostSocketFor(item.first);
+    if (item.second.events & (kEpollIn | kEpollRdhup)) poll.events |= POLLRDNORM;
+    if (item.second.events & kEpollPri) poll.events |= POLLRDBAND;
+    if (item.second.events & kEpollOut) poll.events |= POLLWRNORM;
+    host.push_back(poll);
+    wanted.push_back(item.second);
+  }
+  if (host.empty()) {
+    if (timeout > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
+    return 0;
+  }
+  EnsureWinsock();
+  const int rc = ::WSAPoll(host.data(), static_cast<ULONG>(host.size()),
+                           timeout);
+  if (rc < 0) {
+    ShimNetErrno();
+    return -1;
+  }
+  auto* out = static_cast<GuestEpollEvent*>(events);
+  int ready = 0;
+  for (size_t i = 0; i < host.size() && ready < maxevents; ++i) {
+    if (!host[i].revents) continue;
+    GuestEpollEvent entry = wanted[i];
+    entry.events = 0;
+    if (host[i].revents & (POLLRDNORM | POLLRDBAND)) entry.events |= kEpollIn;
+    if (host[i].revents & POLLWRNORM) entry.events |= kEpollOut;
+    // Errors and hangups are reported whether or not they were asked for.
+    if (host[i].revents & POLLERR) entry.events |= kEpollErr;
+    if (host[i].revents & POLLHUP) entry.events |= kEpollHup;
+    if (host[i].revents & POLLNVAL) entry.events |= kEpollErr;
+    out[ready++] = entry;
+  }
+  if (TracingNet() && (ready || timeout != 0)) {
+    KeepErrno keep;
+    fprintf(stderr, "[net] epoll_wait n=%zu t=%d -> %d (first %#x)\n",
+            host.size(), timeout, ready, ready ? out[0].events : 0u);
+  }
+  return ready;
+}
 int Eventfd(unsigned, int) { return 0x7000002; }
 
-int Sigaction(int, const void*, void*) { return 0; }
+int Sigaction(int sig, const void* act, void* old) {
+  if (act) {
+    const unsigned char* bytes = static_cast<const unsigned char*>(act);
+    const uint32_t flags = *reinterpret_cast<const uint32_t*>(bytes);
+    const uint64_t handler =
+        *reinterpret_cast<const uint64_t*>(bytes + 8);
+    arc_signal_set_handler(sig, handler);
+    static const bool trace = getenv("ARC_TRACE_SIGNALS") != nullptr;
+    if (trace)
+      fprintf(stderr, "[sigaction] sig=%d flags=%#x handler=%#llx\n", sig,
+              flags, static_cast<unsigned long long>(handler));
+  }
+  (void)old;
+  return 0;
+}
 int Sigaddset(void*, int) { return 0; }
 int Sigdelset(void*, int) { return 0; }
 int Sigemptyset(void*) { return 0; }
@@ -1045,8 +1674,36 @@ int Setjmp(void*) { return 0; }
 }
 
 [[noreturn]] void Siglongjmp(void* buf, int value) { Longjmp(buf, value); }
-void FdSetChk(int, void*, uint64_t) {}
-int FdIssetChk(int, const void*, uint64_t) { return 0; }
+// Bionic's fortified fd_set macros. A program built with _FORTIFY_SOURCE -- as
+// every Android shared library is -- does not touch the mask itself: it calls
+// `__FD_SET_chk(fd, set, sizeof set)` and `__FD_ISSET_chk(fd, set, sizeof set)`
+// instead, and the libc does the arithmetic after checking the descriptor
+// against the set's size.
+//
+// So an empty stand-in for these is not a harmless lie: the caller believes the
+// descriptor was added, `select` is given an empty set, and the wait is for
+// something that was never asked about. That is precisely how a TLS client
+// connects successfully, waits for its own socket to become writable, and waits
+// until it times out -- with the connection open the whole time. A Bionic
+// fd_set is a 1024-bit mask, indexed by descriptor, on every architecture.
+void FdSetChk(int fd, void* set, uint64_t size) {
+  if (!set || fd < 0 || static_cast<uint64_t>(fd) >= size * 8) return;
+  auto* bits = static_cast<uint64_t*>(set);
+  bits[fd / 64] |= uint64_t{1} << (fd % 64);
+}
+int FdIssetChk(int fd, const void* set, uint64_t size) {
+  if (!set || fd < 0 || static_cast<uint64_t>(fd) >= size * 8) return 0;
+  const auto* bits = static_cast<const uint64_t*>(set);
+  return (bits[fd / 64] >> (fd % 64)) & 1 ? 1 : 0;
+}
+void FdClrChk(int fd, void* set, uint64_t size) {
+  if (!set || fd < 0 || static_cast<uint64_t>(fd) >= size * 8) return;
+  auto* bits = static_cast<uint64_t*>(set);
+  bits[fd / 64] &= ~(uint64_t{1} << (fd % 64));
+}
+void FdZeroChk(void* set, uint64_t size) {
+  if (set) memset(set, 0, static_cast<size_t>(size));
+}
 
 // POSIX regex and fts. Nothing on a game's hot path uses these; they exist so
 // the engine's rarely-taken diagnostic paths link.
@@ -1074,6 +1731,411 @@ int AndroidBitmapLockPixels(void*, void*, void** pixels) {
   return -1;
 }
 int AndroidBitmapUnlockPixels(void*, void*) { return -1; }
+
+// --- libc tails -------------------------------------------------------------
+// Everything below is a POSIX spelling the Windows CRT does not have, or an
+// Android system-service entry point with no desktop equivalent. They are
+// deliberately small: a wrong answer here would be worse than a clean failure,
+// so each is either an exact forward or an admission that the facility is
+// absent.
+int SystemPropertyGet(const char* key, char* value) {
+  (void)key;
+  if (value) value[0] = '\0';
+  return 0;
+}
+int Setenv(const char* name, const char* value, int overwrite) {
+  if (!name) return -1;
+#if defined(_WIN32)
+  if (!overwrite && getenv(name)) return 0;
+  return _putenv_s(name, value ? value : "");
+#else
+  return setenv(name, value ? value : "", overwrite);
+#endif
+}
+int Unsetenv(const char* name) {
+  if (!name) return -1;
+#if defined(_WIN32)
+  return _putenv_s(name, "");
+#else
+  return unsetenv(name);
+#endif
+}
+struct GuestDlInfo {
+  const char* fname;
+  void* fbase;
+  const char* sname;
+  void* saddr;
+};
+int Dladdr(const void*, GuestDlInfo* info) {
+  if (info) memset(info, 0, sizeof(*info));
+  return 0;  // no name, which is what a statically linked host can honestly say
+}
+int PthreadAtfork(void*, void*, void*) { return 0; }
+int PthreadSigmask(int, const void*, void*) { return 0; }
+unsigned Getegid() { return 0; }
+uint32_t InetAddr(const char* text) {
+  struct in_addr a{};
+  if (!text || ::inet_pton(AF_INET, text, &a) != 1) return 0xffffffffu;
+  return a.s_addr;
+}
+char* InetNtoa(struct in_addr address) {
+  static char text[INET_ADDRSTRLEN];
+  return ::inet_ntop(AF_INET, &address, text, sizeof text) ? text : nullptr;
+}
+size_t Strlcpy(char* dst, const char* src, size_t size) {
+  const size_t len = src ? strlen(src) : 0;
+  if (dst && size) {
+    const size_t n = len < size - 1 ? len : size - 1;
+    if (n) memcpy(dst, src, n);
+    dst[n] = '\0';
+  }
+  return len;
+}
+long Lrand48() { return rand(); }
+int ClockGetres(int, void* resolution) {
+  if (resolution) memset(resolution, 0, sizeof(uint64_t) * 2);
+  return 0;
+}
+int Setpriority(int, int, int) { return 0; }
+int Dup(int fd) {
+#if defined(_WIN32)
+  return _dup(fd);
+#else
+  return dup(fd);
+#endif
+}
+int Msync(void* address, size_t length, int) {
+#if defined(_WIN32)
+  return FlushViewOfFile(address, length) ? 0 : -1;
+#else
+  return msync(address, length, MS_SYNC);
+#endif
+}
+long long Getline(char** line, size_t* capacity, FILE* stream) {
+  if (!line || !capacity || !stream) return -1;
+  if (!*line || *capacity == 0) {
+    *capacity = 256;
+    *line = static_cast<char*>(malloc(*capacity));
+    if (!*line) {
+      *capacity = 0;
+      return -1;
+    }
+  }
+  size_t used = 0;
+  int ch = EOF;
+  while ((ch = fgetc(stream)) != EOF) {
+    if (used + 1 >= *capacity) {
+      const size_t grow = *capacity * 2;
+      char* next = static_cast<char*>(realloc(*line, grow));
+      if (!next) return -1;
+      *line = next;
+      *capacity = grow;
+    }
+    (*line)[used++] = static_cast<char>(ch);
+    if (ch == '\n') break;
+  }
+  if (used == 0 && ch == EOF) return -1;
+  (*line)[used] = '\0';
+  return static_cast<long long>(used);
+}
+FILE* Popen(const char* command, const char* mode) {
+#if defined(_WIN32)
+  return _popen(command, mode);
+#else
+  return popen(command, mode);
+#endif
+}
+int Pclose(FILE* stream) {
+#if defined(_WIN32)
+  return _pclose(stream);
+#else
+  return pclose(stream);
+#endif
+}
+void* MemsetChk(void* dst, int c, size_t n, size_t) { return memset(dst, c, n); }
+int VsprintfChk(char* dst, int, size_t size, const char* format, va_list ap) {
+  return vsnprintf(dst, size, format, ap);
+}
+char* StrncpyChk(char* dst, const char* src, size_t n, size_t) {
+  return strncpy(dst, src, n);
+}
+char* StrncpyChk2(char* dst, const char* src, size_t n, size_t, size_t) {
+  return strncpy(dst, src, n);
+}
+// Bionic's pthread_attr_t (bits/pthread_types.h, LP64):
+//   uint32 flags; void* stack_base; size_t stack_size; size_t guard_size;
+//   int32 sched_policy; int32 sched_priority; char reserved[16];
+// pthread_getattr_np followed by pthread_attr_getstack is how il2cpp finds the
+// main thread's stack bottom. Returning success while leaving the attribute
+// zeroed makes it conclude the bottom is absurd and call abort().
+struct GuestPthreadAttr {
+  uint32_t flags;
+  uint32_t pad;
+  void* stack_base;
+  size_t stack_size;
+  size_t guard_size;
+  int32_t sched_policy;
+  int32_t sched_priority;
+  char reserved[16];
+};
+static_assert(sizeof(GuestPthreadAttr) == 56, "Bionic pthread_attr_t size");
+
+void CurrentStackBounds(void** base, size_t* size) {
+  void* low = nullptr;
+  size_t span = 0;
+#if defined(_WIN32)
+  ULONG_PTR lo = 0;
+  ULONG_PTR hi = 0;
+  GetCurrentThreadStackLimits(&lo, &hi);
+  low = reinterpret_cast<void*>(lo);
+  span = static_cast<size_t>(hi - lo);
+#else
+  pthread_attr_t attr;
+  if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+    pthread_attr_getstack(&attr, &low, &span);
+    pthread_attr_destroy(&attr);
+  }
+#endif
+  if (base) *base = low;
+  if (size) *size = span;
+}
+
+int PthreadGetattrNp(void*, void* attr) {
+  if (!attr) return 22;
+  auto* out = static_cast<GuestPthreadAttr*>(attr);
+  memset(out, 0, sizeof(*out));
+  CurrentStackBounds(&out->stack_base, &out->stack_size);
+  out->guard_size = 4096;
+  return 0;
+}
+int PthreadAttrGetstack(const void* attr, void** base, size_t* size) {
+  if (!attr) return 22;
+  const auto* in = static_cast<const GuestPthreadAttr*>(attr);
+  if (base) *base = in->stack_base;
+  if (size) *size = in->stack_size;
+  return 0;
+}
+int PthreadAttrSetstack(void* attr, void* base, size_t size) {
+  if (!attr) return 22;
+  auto* out = static_cast<GuestPthreadAttr*>(attr);
+  out->stack_base = base;
+  out->stack_size = size;
+  return 0;
+}
+int Futimens(int fd, const void*) {
+#if defined(_WIN32)
+  return _commit(fd);
+#else
+  return 0;
+#endif
+}
+int Utime(const char*, const void*) { return 0; }
+int SemGetvalue(void*, int* value) {
+  if (value) *value = 0;
+  return 0;
+}
+int SemTimedwait(void*, const void*) { return -1; }
+long long Pread(int fd, void* buffer, size_t count, long long offset) {
+#if defined(_WIN32)
+  const __int64 old = _lseeki64(fd, 0, SEEK_CUR);
+  if (old < 0 || _lseeki64(fd, offset, SEEK_SET) < 0) return -1;
+  const int n = _read(fd, buffer, static_cast<unsigned>(count));
+  _lseeki64(fd, old, SEEK_SET);
+  return n;
+#else
+  return pread(fd, buffer, count, offset);
+#endif
+}
+long long Pwrite(int fd, const void* buffer, size_t count, long long offset) {
+#if defined(_WIN32)
+  const __int64 old = _lseeki64(fd, 0, SEEK_CUR);
+  if (old < 0 || _lseeki64(fd, offset, SEEK_SET) < 0) return -1;
+  const int n = _write(fd, buffer, static_cast<unsigned>(count));
+  _lseeki64(fd, old, SEEK_SET);
+  return n;
+#else
+  return pwrite(fd, buffer, count, offset);
+#endif
+}
+int Getuid() { return 0; }
+int Getrusage(int, void* usage) {
+  // Bionic's struct rusage is two timevals followed by fourteen longs. The
+  // engine only ever asks for a zeroed baseline here; leaving it untouched
+  // would hand back uninitialised stack words instead of "no time used".
+  if (usage) memset(usage, 0, 16 * 2 + 8 * 14);
+  return 0;
+}
+int InetAton(const char* text, void* out) {
+  unsigned a = 0, b = 0, c = 0, d = 0;
+  char tail = 0;
+  if (!text || !out) return 0;
+  if (sscanf(text, "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) return 0;
+  if (a > 255 || b > 255 || c > 255 || d > 255) return 0;
+  auto* p = static_cast<unsigned char*>(out);
+  p[0] = static_cast<unsigned char>(a);
+  p[1] = static_cast<unsigned char>(b);
+  p[2] = static_cast<unsigned char>(c);
+  p[3] = static_cast<unsigned char>(d);
+  return 1;
+}
+// The guest's iovec is pointer-then-length, the same shape as on Linux. The
+// host socket API is not vectorised at this layer, so a loop is the honest
+// translation; the short-write rule is the same one writev has always had.
+struct GuestIovec {
+  void* base;
+  size_t len;
+};
+long long Writev(int fd, const void* vector, int count) {
+  if (!vector || count <= 0) return 0;
+  const auto* iov = static_cast<const GuestIovec*>(vector);
+  long long total = 0;
+  for (int i = 0; i < count; ++i) {
+    long long n = Send(fd, iov[i].base, iov[i].len, 0);
+#if defined(_WIN32)
+    if (n < 0) n = _write(fd, iov[i].base, static_cast<unsigned>(iov[i].len));
+#endif
+    if (n < 0) return total ? total : -1;
+    total += n;
+    if (static_cast<uint64_t>(n) < iov[i].len) break;
+  }
+  return total;
+}
+long long Readv(int fd, const void* vector, int count) {
+  if (!vector || count <= 0) return 0;
+  const auto* iov = static_cast<const GuestIovec*>(vector);
+  long long total = 0;
+  for (int i = 0; i < count; ++i) {
+    long long n = Recv(fd, iov[i].base, iov[i].len, 0);
+#if defined(_WIN32)
+    if (n < 0) n = _read(fd, iov[i].base, static_cast<unsigned>(iov[i].len));
+#endif
+    if (n < 0) return total ? total : -1;
+    total += n;
+    if (static_cast<uint64_t>(n) < iov[i].len) break;
+  }
+  return total;
+}
+int PthreadGetschedparam(void*, int* policy, void* param) {
+  if (policy) *policy = 0;
+  if (param) memset(param, 0, sizeof(int));
+  return 0;
+}
+int SchedGetPriorityMax(int) { return 0; }
+int SchedGetPriorityMin(int) { return 0; }
+void Tzset() {
+#if defined(_WIN32)
+  _tzset();
+#else
+  tzset();
+#endif
+}
+int IfIndextoname(unsigned, char*) { return 0; }
+void* Getservbyname(const char*, const char*) { return nullptr; }
+int* GetHErrno() {
+  static thread_local int err = 0;
+  return &err;
+}
+void* CmsgNxthdr(void*, void*) { return nullptr; }
+int Execvp(const char*, char* const*) { return -1; }
+int Tcgetattr(int, void*) { return -1; }
+int Tcsetattr(int, int, const void*) { return 0; }
+void GcovDump() {}
+void GcovFlush() {}
+// Abseil's cordz sampler has a thread-local initialisation wrapper. There is no
+// cordz sampler in this port, so the wrapper has no work to do; resolving it
+// keeps the PLT from falling through to its resolver.
+void AbseilCordzTlsInit() {}
+void DeferredActionTlsInit() {}
+const void* SystemPropertyFind(const char*) { return nullptr; }
+int SystemPropertyRead(const void*, char*, char*) { return 0; }
+void* Gethostbyaddr(const void*, unsigned, int) { return nullptr; }
+int AndroidLogBufWrite(int, int, const char*, const char*) { return 0; }
+long double Ldexpl(long double value, int exponent) {
+  return ldexp(static_cast<double>(value), exponent);
+}
+long double Frexpl(long double value, int* exponent) {
+  return frexp(static_cast<double>(value), exponent);
+}
+long long Sendmmsg(int, const void*, unsigned, int) { return -1; }
+long long Recvmmsg(int, void*, unsigned, int, void*) { return -1; }
+long long Sendmsg(int, const void*, int) { return -1; }
+long long Recvmsg(int, void*, int) { return -1; }
+int Sigsuspend(const void*) {
+  // The collector's handler calls this to wait for the stop count to advance.
+  // The host has no signal frame to return from, so a short sleep is the
+  // equivalent of blocking: it keeps the suspended thread off the CPU while
+  // still noticing a resume promptly. A pending signal is consumed here so the
+  // handler is not re-entered.
+  arc_set_wait_reason("sigsuspend");
+  if (arc_signal_pending_current()) arc_signal_take_current();
+  std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  arc_set_wait_reason(nullptr);
+  errno = 4 /* EINTR */;
+  return -1;
+}
+int Execve(const char*, char* const*, char* const*) { return -1; }
+void PthreadCleanupPush(void*, void*) {}
+void PthreadCleanupPop(void*) {}
+
+// --- Android sensors and loopers -------------------------------------------
+//
+// Unity asks the platform whether a device has an accelerometer/gyroscope while
+// it builds the display and input managers. There is no sensor on a desktop,
+// and no Android looper either, so the honest answer is a manager that exists
+// but reports an empty sensor list. The earlier behaviour -- a guard-page trap
+// on ASensorManager_getInstance -- stopped startup before the renderer ever
+// reached its first frame.
+int g_sensor_manager_token;
+int g_sensor_queue_token;
+
+void* SensorManagerGetInstance() { return &g_sensor_manager_token; }
+void* SensorManagerGetInstanceForPackage(const char*) {
+  return &g_sensor_manager_token;
+}
+int SensorManagerGetSensorList(void*, const void** list) {
+  if (list) *list = nullptr;
+  return 0;
+}
+void* SensorManagerGetDefaultSensor(void*, int) { return nullptr; }
+void* SensorManagerGetDefaultSensorEx(void*, int, int) { return nullptr; }
+void* SensorManagerCreateEventQueue(void*, void*, int, void*, void*) {
+  return &g_sensor_queue_token;
+}
+int SensorManagerDestroyEventQueue(void*, void*) { return 0; }
+int SensorEventQueueEnableSensor(void*, void*) { return 0; }
+int SensorEventQueueDisableSensor(void*, void*) { return 0; }
+int SensorEventQueueSetEventRate(void*, void*, int) { return 0; }
+int SensorEventQueueHasEvents(void*) { return 0; }
+long long SensorEventQueueGetEvents(void*, void*, unsigned long long) {
+  return 0;
+}
+int SensorGetType(const void*) { return 0; }
+float SensorGetResolution(const void*) { return 0.0f; }
+int SensorGetMinDelay(const void*) { return 0; }
+const char* SensorGetName(const void*) { return ""; }
+const char* SensorGetVendor(const void*) { return "androidrecomp"; }
+const char* SensorGetStringType(const void*) { return "android.sensor.unknown"; }
+
+int g_looper_token;
+thread_local int t_looper_token;
+void* LooperForThread() { return &t_looper_token; }
+void* LooperPrepare(int) { return &t_looper_token; }
+void LooperAcquire(void*) {}
+void LooperRelease(void*) {}
+void LooperWake(void*) {}
+int LooperPollOnce(int, int, int* out_fd, int* out_events, void** out_data) {
+  if (out_fd) *out_fd = -1;
+  if (out_events) *out_events = 0;
+  if (out_data) *out_data = nullptr;
+  return -3;  // ALOOPER_POLL_TIMEOUT
+}
+int LooperPollAll(int timeout, int* out_fd, int* out_events, void** out_data) {
+  return LooperPollOnce(timeout, 0, out_fd, out_events, out_data);
+}
+int LooperAddFd(void*, int, int, int, void*, void*) {
+  return 1;  // ALOOPER_POLL_CALLBACK
+}
+int LooperRemoveFd(void*, int) { return 0; }
 
 struct Entry {
   const char* name;
@@ -1103,7 +2165,10 @@ const Entry kTable[] = {
     E("dl_iterate_phdr", DlIteratePhdr),
 
     E("getpid", Getpid),            E("gettid", Gettid),
-    E("geteuid", Geteuid),          E("getpwuid_r", Getpwuid_r),
+    E("getuid", Getuid),            E("geteuid", Geteuid),
+    E("getpwuid", Getpwuid),        E("getpwuid_r", Getpwuid_r),
+    E("getpwnam", Getpwnam),
+    E("getrusage", Getrusage),
     E("sysconf", Sysconf),          E("getauxval", Getauxval),
     E("syscall", Syscall),          E("uname", Uname),
     E("fork", Fork),                E("execl", Execl),
@@ -1115,6 +2180,7 @@ const Entry kTable[] = {
     E("prctl", Prctl),              E("statfs", Statfs),
     E("epoll_create", EpollCreate), E("epoll_create1", EpollCreate1),
     E("epoll_ctl", EpollCtl),       E("epoll_wait", EpollWait),
+    E("epoll_pwait", EpollWait),
     E("eventfd", Eventfd),
 
     E("sigaction", Sigaction),      E("sigaddset", Sigaddset),
@@ -1123,6 +2189,7 @@ const Entry kTable[] = {
     E("setjmp", Setjmp),           E("longjmp", Longjmp),
     E("siglongjmp", Siglongjmp),
     E("__FD_SET_chk", FdSetChk),    E("__FD_ISSET_chk", FdIssetChk),
+    E("__FD_CLR_chk", FdClrChk),    E("__FD_ZERO_chk", FdZeroChk),
 
     E("regcomp", Regcomp),          E("regexec", Regexec),
     E("regerror", Regerror),        E("regfree", Regfree),
@@ -1133,15 +2200,139 @@ const Entry kTable[] = {
     E("AndroidBitmap_getInfo", AndroidBitmapGetInfo),
     E("AndroidBitmap_lockPixels", AndroidBitmapLockPixels),
     E("AndroidBitmap_unlockPixels", AndroidBitmapUnlockPixels),
+
+    E("ASensorManager_getInstance", SensorManagerGetInstance),
+    E("ASensorManager_getInstanceForPackage", SensorManagerGetInstanceForPackage),
+    E("ASensorManager_getSensorList", SensorManagerGetSensorList),
+    E("ASensorManager_getDefaultSensor", SensorManagerGetDefaultSensor),
+    E("ASensorManager_getDefaultSensorEx", SensorManagerGetDefaultSensorEx),
+    E("ASensorManager_createEventQueue", SensorManagerCreateEventQueue),
+    E("ASensorManager_destroyEventQueue", SensorManagerDestroyEventQueue),
+    E("ASensorEventQueue_enableSensor", SensorEventQueueEnableSensor),
+    E("ASensorEventQueue_disableSensor", SensorEventQueueDisableSensor),
+    E("ASensorEventQueue_setEventRate", SensorEventQueueSetEventRate),
+    E("ASensorEventQueue_hasEvents", SensorEventQueueHasEvents),
+    E("ASensorEventQueue_getEvents", SensorEventQueueGetEvents),
+    E("ASensor_getType", SensorGetType),
+    E("ASensor_getResolution", SensorGetResolution),
+    E("ASensor_getMinDelay", SensorGetMinDelay),
+    E("ASensor_getName", SensorGetName),
+    E("ASensor_getVendor", SensorGetVendor),
+    E("ASensor_getStringType", SensorGetStringType),
+    E("ALooper_forThread", LooperForThread),
+    E("ALooper_prepare", LooperPrepare),
+    E("ALooper_acquire", LooperAcquire),
+    E("ALooper_release", LooperRelease),
+    E("ALooper_wake", LooperWake),
+    E("ALooper_pollOnce", LooperPollOnce),
+    E("ALooper_pollAll", LooperPollAll),
+    E("ALooper_addFd", LooperAddFd),
+    E("ALooper_removeFd", LooperRemoveFd),
+
+    E("__system_property_get", SystemPropertyGet),
+    E("__system_property_find", SystemPropertyFind),
+    E("__system_property_read", SystemPropertyRead),
+    E("__android_log_buf_write", AndroidLogBufWrite),
+    E("gethostbyaddr", Gethostbyaddr),
+    E("_ZTH15gDeferredAction", DeferredActionTlsInit),
+    E("setenv", Setenv),            E("unsetenv", Unsetenv),
+    E("dladdr", Dladdr),            E("pthread_atfork", PthreadAtfork),
+    E("pthread_sigmask", PthreadSigmask), E("getegid", Getegid),
+    E("inet_addr", InetAddr),       E("inet_ntoa", InetNtoa),
+    E("inet_aton", InetAton),       E("getservbyname", Getservbyname),
+    E("if_indextoname", IfIndextoname), E("__get_h_errno", GetHErrno),
+    E("__cmsg_nxthdr", CmsgNxthdr),
+    E("sendmmsg", Sendmmsg),        E("recvmmsg", Recvmmsg),
+    E("writev", Writev),            E("readv", Readv),
+    E("pthread_getschedparam", PthreadGetschedparam),
+    E("sched_get_priority_max", SchedGetPriorityMax),
+    E("sched_get_priority_min", SchedGetPriorityMin),
+    E("tzset", Tzset),              E("execvp", Execvp),
+    E("tcgetattr", Tcgetattr),      E("tcsetattr", Tcsetattr),
+    E("__gcov_dump", GcovDump),     E("__gcov_flush", GcovFlush),
+    E("_ZTHN4absl12lts_2024011613cord_internal17cordz_next_sampleE",
+      AbseilCordzTlsInit),
+    E("ldexpl", Ldexpl),            E("frexpl", Frexpl),
+    E("strlcpy", Strlcpy),          E("lrand48", Lrand48),
+    E("clock_getres", ClockGetres), E("setpriority", Setpriority),
+    E("dup", Dup),                  E("msync", Msync),
+    E("getline", Getline),          E("popen", Popen),
+    E("pclose", Pclose),            E("__memset_chk", MemsetChk),
+    E("__vsprintf_chk", VsprintfChk), E("__strncpy_chk", StrncpyChk),
+    E("__strncpy_chk2", StrncpyChk2),
+    E("pthread_getattr_np", PthreadGetattrNp),
+    E("pthread_attr_getstack", PthreadAttrGetstack),
+    E("pthread_attr_setstack", PthreadAttrSetstack),
+    E("futimens", Futimens),        E("utime", Utime),
+    E("sem_getvalue", SemGetvalue), E("sem_timedwait", SemTimedwait),
+    E("pread", Pread),              E("pwrite", Pwrite),
+    E("sendmsg", Sendmsg),          E("recvmsg", Recvmsg),
+    E("sigsuspend", Sigsuspend),    E("execve", Execve),
+    E("__pthread_cleanup_push", PthreadCleanupPush),
+    E("__pthread_cleanup_pop", PthreadCleanupPop),
 };
 #undef E
 
 }  // namespace
 
+int64_t HostCoreCount() { return CoreCount(); }
+
+void ShimRegisterPlugin(const char* soname, ArcPluginFn generic) {
+  RegisterPlugin(soname, generic);
+}
+
+void ShimRegisterPluginSymbol(const char* soname, const char* symbol,
+                              ArcPluginFn fn) {
+  RegisterPluginSymbol(soname, symbol, fn);
+}
+
+void ShimRegisterPluginResolver(const char* soname, ArcPluginResolve resolve) {
+  RegisterPluginResolver(soname, resolve);
+}
+
 uint64_t ShimGuestSymbol(const char* name) {
   std::lock_guard<std::mutex> g(g_images_lock);
   for (const ElfImage* img : g_images)
     if (uint64_t a = img->Lookup(name)) return a;
+  return 0;
+}
+
+// The socket descriptor map, for the file layer and for select. Declared in
+// shim.h; defined here because this is where the map lives.
+uint64_t ShimHostSocket(int fd) {
+  std::lock_guard<std::mutex> held(g_socket_map_lock);
+  const auto it = g_guest_to_host.find(fd);
+  return it == g_guest_to_host.end() ? 0
+                                     : static_cast<uint64_t>(it->second);
+}
+
+int ShimGuestSocket(uint64_t host) {
+  std::lock_guard<std::mutex> held(g_socket_map_lock);
+  const auto it = g_host_to_guest.find(static_cast<SOCKET>(host));
+  return it == g_host_to_guest.end() ? -1 : it->second;
+}
+
+void ShimForgetGuestSocket(int fd) {
+  std::lock_guard<std::mutex> held(g_socket_map_lock);
+  const auto it = g_guest_to_host.find(fd);
+  if (it == g_guest_to_host.end()) return;
+  g_host_to_guest.erase(it->second);
+  g_guest_to_host.erase(it);
+}
+
+void ShimTraceSocketIo(const char* what, int fd, int64_t want, int64_t got,
+                       const void* buf) {
+  TraceIo(what, fd, want, got);
+  TraceBody(what, buf, got);
+}
+
+int ShimCloseEpoll(int fd) {
+  const int index = fd - kEpollFirst;
+  if (index < 0 || index >= kEpollInstances) return -1;
+  std::lock_guard<std::mutex> held(g_epoll_lock);
+  if (!g_epolls[index].open) return -1;
+  g_epolls[index].open = false;
+  g_epolls[index].watched.clear();
   return 0;
 }
 
@@ -1179,7 +2370,31 @@ void ShimRegisterImage(const ElfImage* image) {
   g_images.push_back(image);
 }
 
+// TEMPORARY probe: attribute the boot-time memcpy storm. Gated by
+// ARC_MEMCPY_TRACE; remove once the caller is understood.
+static void* ProbeMemcpy(void* dst, const void* src, size_t count) {
+  static const bool on = getenv("ARC_MEMCPY_TRACE") != nullptr;
+  static unsigned long long calls;
+  static unsigned long long bytes;
+  const unsigned long long index = calls++;
+  bytes += count;
+  if (on && (index < 80 || (index % 2000) == 0)) {
+    Arm64Ctx* c = arc_current_guest_context();
+    fprintf(stderr,
+            "[memcpy] n=%llu totalMB=%llu dst=%p src=%p lr=%#llx caller=%#llx "
+            "sp=%#llx\n",
+            static_cast<unsigned long long>(count),
+            static_cast<unsigned long long>(bytes >> 20), dst, src,
+            c ? static_cast<unsigned long long>(c->x[30]) : 0,
+            c ? static_cast<unsigned long long>(arc_ld64(c->sp)) : 0,
+            c ? static_cast<unsigned long long>(c->sp) : 0);
+  }
+  return memcpy(dst, src, count);
+}
+
 uint64_t ShimResolveSys(const char* name) {
+  if (strcmp(name, "memcpy") == 0 && getenv("ARC_MEMCPY_TRACE"))
+    return reinterpret_cast<uint64_t>(&ProbeMemcpy);
   for (const Entry& e : kTable)
     if (strcmp(e.name, name) == 0) return reinterpret_cast<uint64_t>(e.fn);
   return 0;

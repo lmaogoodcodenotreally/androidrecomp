@@ -29,6 +29,7 @@ namespace arc {
 namespace {
 
 std::string g_root;
+std::string g_library_root;
 
 // Opaque to the guest: it only ever holds the pointer and hands it back.
 struct Manager {
@@ -207,6 +208,27 @@ const Entry kEntries[] = {
 void ShimSetAssetRoot(const char* path) { g_root = path ? path : ""; }
 
 const char* ShimAssetRoot() { return g_root.c_str(); }
+
+// The host file an asset name names. `Resolve` is the one place that knows how
+// an asset name becomes a path here, and a port answering a call that copies an
+// asset out -- Nabe's AndroidUtil.Copy streams an APK asset to a file -- needs
+// exactly the same answer. False if the name is empty, the root unset, or the
+// result does not fit.
+bool ShimAssetPath(const char* name, char* out, size_t size) {
+  if (!name || !out || !size || g_root.empty()) return false;
+  const std::filesystem::path path = Resolve(name);
+  if (path.empty()) return false;
+  const std::string text = path.generic_string();
+  if (text.size() >= size) return false;
+  memcpy(out, text.c_str(), text.size() + 1);
+  return true;
+}
+
+void ShimSetLibraryRoot(const char* path) {
+  g_library_root = path ? path : "";
+}
+
+const char* ShimLibraryRoot() { return g_library_root.c_str(); }
 
 uint64_t ShimResolveAsset(const char* name) {
   // Only claimed once a root is set. Left unresolved otherwise, the name shows

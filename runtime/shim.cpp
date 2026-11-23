@@ -109,18 +109,6 @@ int* Errno() { return &errno; }
 int CxaAtexit(void (*)(void*), void*, void*) { return 0; }
 void CxaFinalize(void*) {}
 
-// The guest ending the process is a result, not a crash. Left to resolve
-// through the host C runtime, a title that decides initialisation has failed
-// simply terminates us -- no message, no fault, nothing to distinguish it from
-// a lifter bug. Intercepting it turns "the process died" into "the engine gave
-// up, and here is the code it gave up with".
-[[noreturn]] void GuestExit(int status) {
-  char msg[64];
-  snprintf(msg, sizeof(msg), "the guest called exit(%d)", status);
-  arc_trap(nullptr, msg);
-  abort();  // only reached if no recovery point is armed
-}
-
 [[noreturn]] void GuestAbort() {
   arc_trap(nullptr, "the guest called abort()");
   abort();
@@ -391,7 +379,48 @@ int AtoiSafe(const char* s) {
   return atoi(s);
 }
 
+#if defined(ARC_HAVE_ZLIB)
+uint64_t ZlibCrc32(uint64_t crc, const void* buf, uint32_t len) {
+  return crc32(static_cast<uLong>(crc), static_cast<const Bytef*>(buf), len);
+}
+#endif
+
+// The guest reads `environ` as a data symbol, so the import needs an address
+// rather than a function. `environ` is a variable of type char**, not the
+// array itself: the GOT slot holds its address, the first load reads the
+// array pointer, and the second reads the first string. Exporting the array
+// directly made the guest treat the first element as the array and dereference
+// null -- an empty environment must still have the extra indirection.
+char* g_environ_entries[] = {nullptr};
+char** g_environ = g_environ_entries;
+
+// The guest is a Linux target, and it is not only libc that believes so: the
+// managed runtime's `Path` uses Unix rules. A host path such as
+// `C:\Temp` does not start with '/', so `Path.Combine` treats it as relative
+// and appends it -- which turned a temp directory into a component of a path
+// that already had two other roots. Answer the environment questions that
+// feed those paths with the guest's own virtual root, and let the file shim
+// translate it. Everything else goes to the host unchanged, because a title
+// asks for its own variables by name and a table here would be guessing.
+const char* ShimGetenv(const char* name) {
+  if (!name) return nullptr;
+  if (strcmp(name, "TMPDIR") == 0 || strcmp(name, "TEMP") == 0 ||
+      strcmp(name, "TMP") == 0)
+    return "/androidrecomp/tmp";
+  if (strcmp(name, "HOME") == 0 || strcmp(name, "USERPROFILE") == 0)
+    return "/androidrecomp/storage";
+  if (strcmp(name, "PWD") == 0) return "/androidrecomp/cwd";
+  if (strcmp(name, "LANG") == 0 || strcmp(name, "LC_ALL") == 0)
+    return "en_US.UTF-8";
+  const char* v = getenv(name);
+  if (getenv("ARC_TRACE_ENV") && strncmp(name, "UNITY_", 6) == 0)
+    fprintf(stderr, "[env] %s -> %s\n", name, v ? v : "(null)");
+  return v;
+}
+
 const Entry kExplicit[] = {
+    {"environ", reinterpret_cast<void*>(&g_environ)},
+    {"getenv", reinterpret_cast<void*>(&ShimGetenv)},
     {"strrchr", reinterpret_cast<void*>(&StrrchrSafe)},
     {"atoi", reinterpret_cast<void*>(&AtoiSafe)},
     {"free", reinterpret_cast<void*>(&ArcFree)},
@@ -459,10 +488,13 @@ const Entry kExplicit[] = {
 #if defined(ARC_HAVE_ZLIB)
     // Statically linked libraries bind by explicit address: they are inside
     // our own executable, so a by-name runtime lookup cannot see them. This is
-    // the pattern OpenAL and the GL loader follow too. Bionic's zlib is stock
-    // zlib, so every signature matches.
+    // the pattern OpenAL and the GL loader follow too.
+    //
+    // crc32 is wrapped rather than bound directly: Bionic's uLong is 64 bits
+    // and the host's is 32, so the return value needs zero-extension before
+    // the guest reads the full register.
     {"zlibVersion", reinterpret_cast<void*>(&zlibVersion)},
-    {"crc32", reinterpret_cast<void*>(&crc32)},
+    {"crc32", reinterpret_cast<void*>(&ZlibCrc32)},
 #endif
 };
 
@@ -510,6 +542,22 @@ void* HostLookup(const char* name) {
 
 }  // namespace
 
+// The guest ending the process is a result, not a crash. Left to resolve
+// through the host C runtime, a title that decides initialisation has failed
+// simply terminates us -- no message, no fault, nothing to distinguish it from
+// a lifter bug. Intercepting it turns "the process died" into "the engine gave
+// up, and here is the code it gave up with".
+//
+// Outside the anonymous namespace because the syscall dispatcher answers
+// `exit_group` with this too: libil2cpp issues that syscall directly in places,
+// and that path used to end a run with nothing said at all.
+[[noreturn]] void GuestExit(int status) {
+  char msg[64];
+  snprintf(msg, sizeof(msg), "the guest called exit(%d)", status);
+  arc_trap(nullptr, msg);
+  abort();  // only reached if no recovery point is armed
+}
+
 // Names the host must answer even though a lifted dependency defines them.
 //
 // The resolver prefers lifted code for everything, and rightly: a guest's own
@@ -523,11 +571,90 @@ void ShimStopLeaking() {
     fprintf(stderr, "[shim] recycling freed memory from now on\n");
 }
 
+// A C++ exception, at the throw, because nothing can catch it.
+//
+// No frame here unwinds. Lifted code carries no exception tables and no
+// personality routine, so once libc++ hands an exception to
+// _Unwind_RaiseException there is nowhere to resume and it calls
+// std::terminate. The terminate handler is worse than useless: it is a word
+// the guest's own runtime never managed to install, so instead of an abort
+// message the boot branches to whatever that word happened to hold. The
+// report then says "indirect branch to 0x1b2, neither lifted nor a known
+// import", which names neither the throw nor the type.
+//
+// These two names are the ones whose whole job is to end the process, so the
+// host answers them. A throw is named where it happens -- type, object, and
+// the lifted frames that led there -- and terminate is caught on the way out
+// for the paths that reach it without a preceding throw.
+namespace {
+
+bool CanRead(uint64_t address, size_t size) {
+#if defined(_WIN32)
+  MEMORY_BASIC_INFORMATION mbi;
+  if (!address || !size ||
+      !VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof mbi))
+    return false;
+  if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) return false;
+  return (mbi.Protect &
+          (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+           PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+           PAGE_EXECUTE_WRITECOPY)) != 0;
+#else
+  return address != 0 && size != 0;
+#endif
+}
+
+const char* TypeName(uint64_t type) {
+  if (!type || !CanRead(type + 8, 8)) return 0;
+  const uint64_t p = arc_ld64(type + 8);
+  if (!p || !CanRead(p, 1)) return 0;
+  return reinterpret_cast<const char*>(p);
+}
+
+void LiftedFrames(const char* tag) {
+  const size_t depth = arc_frame_count();
+  for (size_t i = 0; i < depth && i < 16; ++i)
+    fprintf(stderr, "[cxa]     %s from %#llx\n", tag,
+            static_cast<unsigned long long>(arc_frame_at(i)));
+}
+
+void ReportCxaThrow(Arm64Ctx* c) {
+  const uint64_t object = c->x[0];
+  const uint64_t type = c->x[1];
+  const char* name = TypeName(type);
+  fprintf(stderr,
+          "[cxa] uncaught C++ exception: type=%s object=%#llx type_info=%#llx\n",
+          name ? name : "?", static_cast<unsigned long long>(object),
+          static_cast<unsigned long long>(type));
+  LiftedFrames("#");
+  arc_trap(c, "uncaught C++ exception");
+}
+
+void ReportTerminate(Arm64Ctx* c) {
+  fprintf(stderr, "[cxa] std::terminate reached\n");
+  LiftedFrames("#");
+  arc_trap(c, "std::terminate");
+}
+
+}  // namespace
+
 uint64_t ShimOverride(const char* name) {
   static const char* const how = getenv("ARC_PURE_VIRTUAL");
   if (how && strcmp(how, "skip") == 0 &&
       strcmp(name, "__cxa_pure_virtual") == 0)
     return reinterpret_cast<uint64_t>(&PureVirtual);
+  // C++ exceptions cannot be caught here, so the two ends of that path are
+  // answerable names rather than a branch into whatever the handler held.
+  if (strcmp(name, "__cxa_throw") == 0) {
+    const uint64_t at = reinterpret_cast<uint64_t>(&ReportCxaThrow);
+    arc_register_ctx_native(at, "__cxa_throw", &ReportCxaThrow);
+    return at;
+  }
+  if (strcmp(name, "_ZSt9terminatev") == 0) {
+    const uint64_t at = reinterpret_cast<uint64_t>(&ReportTerminate);
+    arc_register_ctx_native(at, "_ZSt9terminatev", &ReportTerminate);
+    return at;
+  }
   return 0;
 }
 
@@ -544,6 +671,7 @@ uint64_t ShimResolve(const char* name) {
   if (uint64_t a = ShimResolvePthread(name)) return a;
   if (uint64_t a = ShimResolvePosix(name)) return a;
   if (uint64_t a = ShimResolveGL(name)) return a;
+  if (uint64_t a = ShimResolveEGL(name)) return a;
   if (uint64_t a = ShimResolveZlib(name)) return a;
   if (uint64_t a = ShimResolveAsset(name)) return a;
   if (uint64_t a = ShimResolveFile(name)) return a;

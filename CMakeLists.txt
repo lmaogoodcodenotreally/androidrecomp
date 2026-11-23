@@ -22,9 +22,11 @@ add_library(androidrecomp STATIC
   runtime/shim_math.cpp
   runtime/shim_posix.cpp
   runtime/shim_gl.cpp
+  runtime/shim_egl.cpp
   runtime/shim_asset.cpp
   runtime/shim_file.cpp
   runtime/shim_sys.cpp
+  runtime/shim_syscall.cpp
   runtime/shim_zlib.cpp
   runtime/shim_varargs.cpp
   runtime/window.cpp
@@ -41,29 +43,55 @@ if(WIN32)
 endif()
 
 # zlib satisfies a dozen imports directly -- Bionic ships stock zlib, so every
-# signature matches. On Windows point CMake at vcpkg:
-#   -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
-find_package(ZLIB QUIET)
-if(ZLIB_FOUND)
-  target_link_libraries(androidrecomp PUBLIC ZLIB::ZLIB)
+# signature matches. Either point CMake at vcpkg, or give it a source tree:
+#   -DARC_ZLIB_SOURCE_DIR=third_party/zlib
+# The source route is what a port with no package manager uses; it builds the
+# same library the engine expects and keeps the build self-contained.
+set(ARC_ZLIB_SOURCE_DIR "" CACHE PATH "zlib source tree to build statically")
+if(ARC_ZLIB_SOURCE_DIR)
+  file(GLOB ARC_ZLIB_SOURCES "${ARC_ZLIB_SOURCE_DIR}/*.c")
+  add_library(arc_zlib STATIC ${ARC_ZLIB_SOURCES})
+  target_include_directories(arc_zlib PUBLIC "${ARC_ZLIB_SOURCE_DIR}")
+  target_link_libraries(androidrecomp PUBLIC arc_zlib)
   target_compile_definitions(androidrecomp PUBLIC ARC_HAVE_ZLIB)
-  message(STATUS "androidrecomp: zlib found")
+  message(STATUS "androidrecomp: zlib built from ${ARC_ZLIB_SOURCE_DIR}")
 else()
-  message(STATUS "androidrecomp: no zlib -- those imports stay on the work list")
+  find_package(ZLIB QUIET)
+  if(ZLIB_FOUND)
+    target_link_libraries(androidrecomp PUBLIC ZLIB::ZLIB)
+    target_compile_definitions(androidrecomp PUBLIC ARC_HAVE_ZLIB)
+    message(STATUS "androidrecomp: zlib found")
+  else()
+    message(STATUS "androidrecomp: no zlib -- those imports stay on the work list")
+  endif()
 endif()
 
 # SDL2 supplies the window, the GL context and the event loop. Without it the
 # library still loads and reports, it just cannot open a window -- and GL
 # imports stay outstanding, since they bind through the live GL driver.
-find_package(SDL2 CONFIG QUIET)
-if(SDL2_FOUND)
-  target_link_libraries(androidrecomp PUBLIC
-    $<TARGET_NAME_IF_EXISTS:SDL2::SDL2>
-    $<TARGET_NAME_IF_EXISTS:SDL2::SDL2main>)
+# The VC development package has no CMake config, so an explicit root is the
+# reliable spelling: -DARC_SDL2_DIR=third_party/SDL2
+set(ARC_SDL2_DIR "" CACHE PATH "SDL2 development root (include/, lib/x64/)")
+if(ARC_SDL2_DIR)
+  add_library(arc_sdl2 SHARED IMPORTED)
+  set_target_properties(arc_sdl2 PROPERTIES
+    IMPORTED_LOCATION "${ARC_SDL2_DIR}/lib/x64/SDL2.dll"
+    IMPORTED_IMPLIB "${ARC_SDL2_DIR}/lib/x64/SDL2.lib"
+    INTERFACE_INCLUDE_DIRECTORIES "${ARC_SDL2_DIR}/include")
+  target_link_libraries(androidrecomp PUBLIC arc_sdl2)
   target_compile_definitions(androidrecomp PUBLIC ARC_HAVE_SDL2)
-  message(STATUS "androidrecomp: SDL2 found -- window enabled")
+  message(STATUS "androidrecomp: SDL2 from ${ARC_SDL2_DIR} -- window enabled")
 else()
-  message(STATUS "androidrecomp: no SDL2 -- headless, no window")
+  find_package(SDL2 CONFIG QUIET)
+  if(SDL2_FOUND)
+    target_link_libraries(androidrecomp PUBLIC
+      $<TARGET_NAME_IF_EXISTS:SDL2::SDL2>
+      $<TARGET_NAME_IF_EXISTS:SDL2::SDL2main>)
+    target_compile_definitions(androidrecomp PUBLIC ARC_HAVE_SDL2)
+    message(STATUS "androidrecomp: SDL2 found -- window enabled")
+  else()
+    message(STATUS "androidrecomp: no SDL2 -- headless, no window")
+  endif()
 endif()
 
 # Standalone triage tool. Ports usually build their own host instead, linking

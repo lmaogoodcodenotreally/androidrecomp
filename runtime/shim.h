@@ -20,6 +20,10 @@
 
 namespace arc {
 
+// How many CPUs the virtual /proc and /sys files should describe. Honours
+// ARC_CORES and defaults to the same count sysconf reports.
+int64_t HostCoreCount();
+
 // Host address for an imported symbol, or 0 if nothing here provides it.
 uint64_t ShimResolve(const char* name);
 
@@ -34,6 +38,27 @@ size_t ShimExplicitCount();
 // so it can wrap a return value. Only ever pass a *host* address: registering
 // a guest one would have it called as if it were host code.
 uint64_t ShimHandOut(uint64_t address, const char* name);
+
+// Optional native plugins. A title may depend on a small Android library that
+// is not one of the core images and whose behaviour the port can answer with
+// host code. Registering it here gives dlopen a non-null handle and dlsym a
+// host thunk, without teaching the loader a title-specific name. `generic`
+// answers every symbol that has no explicit entry; the symbol entry is for the
+// few calls whose result is actually observed.
+typedef uint64_t (*ArcPluginFn)(uint64_t, uint64_t, uint64_t, uint64_t,
+                                uint64_t, uint64_t, uint64_t, uint64_t,
+                                uint64_t, uint64_t, uint64_t, uint64_t);
+void ShimRegisterPlugin(const char* soname, ArcPluginFn generic);
+void ShimRegisterPluginSymbol(const char* soname, const char* symbol,
+                              ArcPluginFn fn);
+// A library whose answers depend on which symbol was asked for -- one calling
+// convention carrying strings, handles and status codes -- cannot be described
+// by a generic entry plus a handful of names. A resolver sees each symbol once,
+// while dlsym still has its name, and returns the thunk that fits; the thunk
+// itself is then reached without knowing its symbol, which is what a native
+// call looks like anyway.
+typedef ArcPluginFn (*ArcPluginResolve)(const char* symbol);
+void ShimRegisterPluginResolver(const char* soname, ArcPluginResolve resolve);
 
 // Threads, semaphores and thread-local keys. Kept in its own file because it
 // carries real state rather than forwarding to something the host already has.
@@ -91,6 +116,17 @@ size_t ShimVaListSize();
 // GL entry points, asked of the GL driver by name. Answers only once a context
 // is current, which is why the window is opened before the engine is loaded.
 uint64_t ShimResolveGL(const char* name);
+uint64_t ShimResolveEGL(const char* name);
+
+// The window and context the EGL shims hand out. The engine moves the context
+// between its own threads with `eglMakeCurrent`, so the shim needs the pair the
+// host created rather than whichever thread happens to be asking.
+void ShimSetGfxWindow(void* window, void* context);
+
+// Whether the engine may swap this frame, and whether it has been presenting on
+// its own. The host owns the occlusion decision; the engine owns the swap.
+void ShimGfxAllowSwap(bool allow);
+bool ShimGfxPresents();
 
 // The GL calls that take a float by value need the guest context to find it,
 // so the dispatcher has to know them as context natives before the first one
@@ -113,6 +149,32 @@ void ShimFillRandom(void* buf, size_t n);
 // disagree exactly where it matters most (EINPROGRESS is 115 there, 112 here).
 int ShimNetErrno();
 
+// The host socket behind a descriptor the guest was handed, or 0 if that
+// descriptor is not a socket this host opened. Android's descriptors and
+// Windows' socket handles are different namespaces with different ranges: a
+// SOCKET is a large opaque value, while a Bionic fd_set is a 1024-bit mask
+// indexed by descriptor, so handing the guest a raw SOCKET is how FD_SET stops
+// fitting in the caller's mask. The shim keeps the small number and the handle
+// apart, and this is the lookup for the file layer, which cannot tell a socket
+// from a file without it.
+uint64_t ShimHostSocket(int fd);
+
+// The guest's descriptor for a host socket, or -1 when there is no mapping.
+int ShimGuestSocket(uint64_t host);
+
+// Drops the mapping for a descriptor the guest has closed.
+void ShimForgetGuestSocket(int fd);
+
+// The same trace the socket entry points print, for the file layer: a client
+// that speaks to a socket through read() and write() -- which every TLS stack
+// wrapping a BIO does -- is otherwise invisible in a network trace, and that is
+// exactly the layer where a redirect succeeds and the handshake still fails.
+void ShimTraceSocketIo(const char* what, int fd, int64_t want, int64_t got,
+                       const void* buf);
+
+// Closes an epoll instance if the descriptor is one, so close() on the value
+// epoll_create returned releases it rather than being handed to the CRT.
+int ShimCloseEpoll(int fd);
 // The Android asset manager, over an ordinary directory. Claimed only once a
 // root is set, so that an unconfigured host leaves the names on the
 // outstanding-import list rather than opening nothing.
@@ -121,13 +183,37 @@ size_t ShimAssetCount();
 void ShimSetAssetRoot(const char* path);
 const char* ShimAssetRoot();
 
+// The host file an asset name names, by the same rules the asset manager uses.
+// A port answering a call that copies an asset out of the APK -- Nabe's Java
+// `AndroidUtil.Copy` streams one to a file -- needs exactly that answer, and
+// re-deriving it outside this file is how the two mappings drift apart.
+bool ShimAssetPath(const char* name, char* out, size_t size);
+
+// The directory holding the ARM64 images, for Java's ClassLoader.findLibrary.
+// A bare "libil2cpp.so" would also work with this host's dlopen, but returning
+// an absolute path keeps any caller that stats or opens the answer on a real
+// file, and it is the answer Android would give.
+void ShimSetLibraryRoot(const char* path);
+const char* ShimLibraryRoot();
+
 // File I/O, directories and memory mapping, at Bionic's struct layouts.
 uint64_t ShimResolveFile(const char* name);
 size_t ShimFileCount();
 
+// The host name for a guest path, by the same rules the file entry points use.
+// For host code answering a call that carries a path. False if it does not fit.
+bool ShimGuestPath(const char* guest, char* out, size_t size);
+
 // Sockets, dynamic linking, process and system.
 uint64_t ShimResolveSys(const char* name);
 size_t ShimSysCount();
+
+// The guest ending the process. Reported rather than allowed to happen quietly,
+// so that a title which decides it cannot continue is distinguishable from a
+// lifter bug. Both the library call and the raw `exit_group` syscall come
+// through here: libil2cpp issues the syscall itself in places, and a run that
+// simply stopped with no message was that path.
+[[noreturn]] void GuestExit(int status);
 
 // Makes a loaded image visible to dlsym and dl_iterate_phdr. Call it for every
 // image the host maps, or guest exception unwinding will not find .eh_frame.
