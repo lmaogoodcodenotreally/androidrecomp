@@ -849,6 +849,66 @@ int Statvfs(const char*, void* buf) {
 int Link(const char*, const char*) { return -1; }
 int Symlink(const char*, const char*) { return -1; }
 int64_t Readlink(const char*, char*, uint64_t) { return -1; }
+
+// rename(2) replaces the destination; the CRT's rename refuses to. That is not
+// a detail: a downloader writes to `name.tmp` and renames into place, and a
+// title that checks its own state by looking for the finished file treats the
+// refusal as "the download never finished". The host CRT was answering this by
+// fallback because the file shim never claimed the name, so every install that
+// had to replace an existing file quietly did nothing and left its temporary
+// behind -- which is exactly what a stalled "Downloading the latest data"
+// looks like from the outside.
+static void SetErrnoFromWin32(unsigned long err) {
+  switch (err) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+    case ERROR_INVALID_DRIVE:
+      errno = ENOENT;
+      break;
+    case ERROR_ACCESS_DENIED:
+    case ERROR_SHARING_VIOLATION:
+    case ERROR_LOCK_VIOLATION:
+      errno = EACCES;
+      break;
+    case ERROR_ALREADY_EXISTS:
+    case ERROR_FILE_EXISTS:
+      errno = EEXIST;
+      break;
+    case ERROR_DISK_FULL:
+    case ERROR_HANDLE_DISK_FULL:
+      errno = ENOSPC;
+      break;
+    default:
+      errno = EIO;
+      break;
+  }
+}
+
+int Rename(const char* from, const char* to) {
+  if (!from || !*from || !to || !*to) {
+    errno = EINVAL;
+    return -1;
+  }
+  const std::string a = HostPath(from);
+  const std::string b = HostPath(to);
+#if defined(_WIN32)
+  // MOVEFILE_COPY_ALLOWED so a rename across volumes still lands, which POSIX
+  // permits when the guest does not care about atomicity.
+  if (MoveFileExA(a.c_str(), b.c_str(),
+                  MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+    TraceFile("rename", to, true);
+    return 0;
+  }
+  SetErrnoFromWin32(GetLastError());
+  TraceFile("rename", to, false);
+  return -1;
+#else
+  const int r = ::rename(a.c_str(), b.c_str());
+  TraceFile("rename", to, r == 0);
+  return r;
+#endif
+}
+
 int Pipe(int*) { return -1; }
 
 // --- directories -----------------------------------------------------------
@@ -1077,6 +1137,7 @@ const Entry kTable[] = {
     E("pathconf", Pathconf),  E("statvfs", Statvfs),
     E("link", Link),          E("symlink", Symlink),
     E("readlink", Readlink),  E("pipe", Pipe),
+    E("rename", Rename),
 
     E("opendir", Opendir),    E("readdir", Readdir),
     E("closedir", Closedir),
