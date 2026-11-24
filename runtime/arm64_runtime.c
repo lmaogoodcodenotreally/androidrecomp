@@ -2085,6 +2085,253 @@ static int ArcWatchCheck(void) {
 // one of those would report where some earlier branch was taken from.
 static ARC_THREAD_LOCAL uint64_t t_dispatch_pc;
 
+/* --- C++ exception transfer ------------------------------------------------
+   A thrown guest exception walks the frame chain with the image's own
+   unwinder, which then asks the personality to resume in an outer frame: a
+   non-local jump. Every lifted call is a host call, so the guest cannot leave
+   the host frames it would have to abandon, and a landing pad is a
+   mid-function address with no dispatchable entry.
+
+   Both halves are solved inside the frame that owns the pad. A function whose
+   FDE carries an LSDA anchors itself on entry (arc_try_enter saves the frame
+   with setjmp) and names its landing pads in a switch. When the unwinder
+   installs the handler's context, the dispatch that performed the install
+   returns with sp above its own frame -- the restored frame is an ancestor, not
+   a callee -- and the innermost anchor whose entry sp is above that restored sp
+   is the frame the unwinder chose. Control then longjmps there, copies the
+   restored register file back over the shared context, and jumps to the pad.
+
+   The same shape as arc_longjmp above: guest state is authoritative and the
+   host stack is disposable. */
+#define ARC_TRY_MAX 512
+typedef struct {
+  jmp_buf host;
+  Arm64Ctx* ctx;
+  uint64_t fn;
+  uint64_t entry_sp;
+  uint64_t shadow;
+  uint32_t token;
+  /* The frame the jump returns into is still live but *abandoned*, and the
+     function that owns it keeps making calls: every call writes its return
+     address to the same slot the anchor's own return address lives in, and the
+     shadow-space home the resumed prologue reloads rbx from is reused for
+     arguments. Both are recorded here on entry and put back before the
+     transfer, or the jump lands in the middle of whatever call happened last. */
+  uint64_t* ret_slot;
+  uint64_t ret_addr;
+  uint64_t* home_slot;
+  uint64_t home_value;
+  /* The frame between the saved stack pointer and the caller's shadow space,
+     captured on entry. The owning function keeps calling after the anchor, and
+     every call reuses that region for its return address and its arguments'
+     shadow, so the jump has to put the whole thing back rather than trust it. */
+  uint8_t* frame_lo;
+  uint32_t frame_len;
+  uint8_t frame_copy[128];
+} ArcTryAnchor;
+
+#if defined(_MSC_VER)
+#define ARC_RETURN_SLOT() ((uint64_t*)_AddressOfReturnAddress())
+#else
+#define ARC_RETURN_SLOT() ((uint64_t*)0)
+#endif
+
+static ARC_THREAD_LOCAL ArcTryAnchor t_try[ARC_TRY_MAX];
+static ARC_THREAD_LOCAL int t_try_depth;
+static ARC_THREAD_LOCAL int t_try_armed;
+static ARC_THREAD_LOCAL Arm64Ctx t_try_state;
+static ARC_THREAD_LOCAL uint64_t t_try_state_shadow;
+static ARC_THREAD_LOCAL uint64_t t_try_pad;
+/* The thrown object of the last transfer, for the allocator: a free of that
+   block is worth naming when the heap complains about it. */
+static uint64_t g_eh_object;
+
+uint64_t arc_eh_object(void) { return g_eh_object; }
+
+static int g_try_on = -1;
+static int g_try_log;
+/* Dispatches to print after a transfer, while it is still being proven. */
+static ARC_THREAD_LOCAL int t_eh_trace;
+
+static int ArcTryEnabled(void) {
+  const char* off = getenv("ARC_EH");
+  g_try_on = (off && off[0] == '0') ? 0 : 1;
+  g_try_log = getenv("ARC_EH_LOG") != NULL;
+  return g_try_on;
+}
+
+int arc_try_enter(uint32_t* token, uint64_t fn, Arm64Ctx* c) {
+  ArcTryAnchor* a;
+  if (t_try_depth >= ARC_TRY_MAX) {
+    arc_trap(c, "inner exception frames exceed ARC_TRY_MAX");
+    return 0;
+  }
+  a = &t_try[t_try_depth];
+  a->ctx = c;
+  a->fn = fn;
+  a->entry_sp = c->sp;
+  a->shadow = (uint64_t)t_shadow_depth;
+  a->token = (uint32_t)t_try_depth;
+  *token = a->token;
+  a->ret_slot = ARC_RETURN_SLOT();
+  a->ret_addr = a->ret_slot ? *a->ret_slot : 0;
+  a->home_slot = a->ret_slot ? a->ret_slot + 1 : 0;
+  a->home_value = a->home_slot ? *a->home_slot : 0;
+  ++t_try_depth;
+  if (setjmp(a->host)) {
+    if (g_try_log) {
+      fprintf(stderr, "[ehx] resumed ctx=%p depth=%d token=%u\n",
+              (void*)a->ctx, t_try_depth, a->token);
+      fflush(stderr);
+    }
+    return 1;
+  }
+  {
+    const _JUMP_BUFFER* saved = (const _JUMP_BUFFER*)a->host;
+    uint8_t* lo = (uint8_t*)(uintptr_t)saved->Rsp;
+    uint8_t* hi = (uint8_t*)a->ret_slot + 0x28;  /* return address + shadow */
+    const size_t len = a->ret_slot && lo < hi ? (size_t)(hi - lo) : 0;
+    if (len > 0 && len <= sizeof a->frame_copy) {
+      memcpy(a->frame_copy, lo, len);
+      a->frame_lo = lo;
+      a->frame_len = (uint32_t)len;
+    } else {
+      a->frame_lo = 0;
+      a->frame_len = 0;
+    }
+  }
+  return 0;
+}
+
+void arc_try_leave(uint32_t token) {
+  if (t_try_depth > 0 && t_try[t_try_depth - 1].token == token) --t_try_depth;
+}
+
+uint64_t arc_try_resume(Arm64Ctx* c) {
+  if (g_try_log)
+    fprintf(stderr,
+            "[ehr] ctx=%p sp_before=%#llx state_sp=%#llx pad=%#llx x0=%#llx "
+            "x1=%#llx depth=%d\n",
+            (void*)c, (unsigned long long)c->sp,
+            (unsigned long long)t_try_state.sp, (unsigned long long)t_try_pad,
+            (unsigned long long)t_try_state.x[0],
+            (unsigned long long)t_try_state.x[1], t_try_depth);
+  *c = t_try_state;
+  t_current_guest_context = c;
+  t_shadow_depth = (size_t)t_try_state_shadow;
+  if (t_is_main_thread) g_main_shadow_depth = t_shadow_depth;
+  return t_try_pad;
+}
+
+void arc_try_failed(void) {
+  fprintf(stderr, "[eh] resumed frame has no case for its landing pad\n");
+  fflush(stderr);
+}
+
+// The transfer back into the anchoring frame. The CRT's longjmp is not usable:
+// it validates the saved frame pointer against the thread's *current* stack
+// window and fast-fails (0xc0000028) instead of jumping when the target is
+// outside it, which is exactly what a handler in an outer frame looks like.
+// NtContinue restores the register file without that policy. The saved state is
+// the CRT's own jmp_buf layout, which is public in setjmp.h.
+typedef long(__stdcall* ArcNtContinue)(void* context, int test_alert);
+
+static ArcNtContinue arc_nt_continue(void) {
+  static ArcNtContinue fn;
+  if (!fn) {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    fn = ntdll ? (ArcNtContinue)(void*)GetProcAddress(ntdll, "NtContinue") : 0;
+    if (!fn) {
+      fprintf(stderr, "[eh] NtContinue is missing from ntdll\n");
+      abort();
+    }
+  }
+  return fn;
+}
+
+static void arc_try_transfer(const jmp_buf buf) {
+#if defined(_WIN32)
+  const _JUMP_BUFFER* saved = (const _JUMP_BUFFER*)buf;
+  CONTEXT ctx;
+  RtlCaptureContext(&ctx);
+  ctx.Rax = 1;  // what longjmp would return, so the anchor takes its resume arm
+  ctx.Rbx = saved->Rbx;
+  ctx.Rbp = saved->Rbp;
+  ctx.Rsi = saved->Rsi;
+  ctx.Rdi = saved->Rdi;
+  ctx.R12 = saved->R12;
+  ctx.R13 = saved->R13;
+  ctx.R14 = saved->R14;
+  ctx.R15 = saved->R15;
+  ctx.Rip = saved->Rip;
+  ctx.Rsp = saved->Rsp;
+  ctx.MxCsr = saved->MxCsr;
+  // xmm6..xmm15 are contiguous in both records: 0x100 in the fxsave image
+  // (xmm6 and xmm7 close the low bank, xmm8..xmm15 open the high one).
+  memcpy((char*)&ctx.FltSave + 0x100, &saved->Xmm6, 10 * 16);
+  ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT;
+  arc_nt_continue()(&ctx, 0);
+  abort();  // NtContinue does not return
+#else
+  longjmp((void*)buf, 1);
+#endif
+}
+
+/* The unwinder just installed a handler context. Move control to the frame that
+   owns the pad it chose. */
+static void arc_try_escape(Arm64Ctx* c) {
+  const uint64_t pad = c->x[30];
+  int i;
+  for (i = t_try_depth - 1; i >= 0; --i) {
+    const ArcTryAnchor* a = &t_try[i];
+    if (a->entry_sp <= c->sp) continue;
+    if (a->entry_sp > c->sp + UINT64_C(0x100000)) continue;
+    if (a->ctx != c) continue;
+    t_try_state = *c;
+    t_try_state_shadow = a->shadow;
+    t_try_pad = pad;
+    g_eh_object = t_try_state.x[0];
+    t_try_depth = i + 1;
+    if (g_try_log) t_eh_trace = 60;
+    /* Put the abandoned frame back the way the anchor left it. */
+    {
+      const uint64_t ret_now = a->ret_slot ? *a->ret_slot : 0;
+      const uint64_t home_now = a->home_slot ? *a->home_slot : 0;
+      if (g_try_log && (ret_now != a->ret_addr || home_now != a->home_value)) {
+        fprintf(stderr,
+                "[ehl] frame=%#llx ret=%#llx ret_now=%#llx home=%#llx "
+                "home_now=%#llx\n",
+                (unsigned long long)a->fn, (unsigned long long)a->ret_addr,
+                (unsigned long long)ret_now, (unsigned long long)a->home_value,
+                (unsigned long long)home_now);
+        fflush(stderr);
+      }
+      if (a->ret_slot) *a->ret_slot = a->ret_addr;
+      if (a->home_slot) *a->home_slot = a->home_value;
+      if (a->frame_lo && a->frame_len)
+        memcpy(a->frame_lo, a->frame_copy, a->frame_len);
+    }
+    if (g_try_log) {
+      const _JUMP_BUFFER* saved = (const _JUMP_BUFFER*)a->host;
+      const NT_TIB* tib = (const NT_TIB*)NtCurrentTeb();
+      fprintf(stderr,
+              "[eh] pad=%#llx frame=%#llx sp=%#llx entry=%#llx depth=%d/%d "
+              "host_sp=%#llx host_rip=%#llx now_sp=%#llx window=[%p,%p)\n",
+              (unsigned long long)pad, (unsigned long long)a->fn,
+              (unsigned long long)c->sp, (unsigned long long)a->entry_sp, i,
+              t_try_depth, (unsigned long long)saved->Rsp,
+              (unsigned long long)saved->Rip, (unsigned long long)(uintptr_t)_AddressOfReturnAddress(),
+              tib->StackLimit, tib->StackBase);
+      fflush(stderr);
+    }
+    if (getenv("ARC_EH_CRT")) longjmp(t_try[i].host, 1);
+    arc_try_transfer(t_try[i].host);
+  }
+  fprintf(stderr, "[eh] no anchored frame for pad=%#llx sp=%#llx depth=%d\n",
+          (unsigned long long)pad, (unsigned long long)c->sp, t_try_depth);
+  fflush(stderr);
+}
+
 /* --- data watch -----------------------------------------------------------
    The counterpart of ARC_WATCH_QWORD for a slot whose address is only known at
    runtime: arm it from a probe and every guest store into the range reports the
@@ -2236,6 +2483,15 @@ static const char* ArcSafeText(uint64_t address) {
 
 void arc_dispatch(Arm64Ctx* c, uint64_t target) {
   Arm64Ctx* const previous_guest = t_current_guest_context;
+  if (t_eh_trace > 0) {
+    --t_eh_trace;
+    fprintf(stderr,
+            "[eht] ctx=%p sp=%#llx target=%#llx lr=%#llx x0=%#llx x1=%#llx\n",
+            (void*)c, (unsigned long long)c->sp,
+            (unsigned long long)target, (unsigned long long)c->x[30],
+            (unsigned long long)c->x[0], (unsigned long long)c->x[1]);
+    fflush(stderr);
+  }
   c->pc = t_dispatch_pc;
   t_dispatch_pc = 0;
   if (target && target == g_small_copy_target && !arc_data_watch_count &&
@@ -2554,10 +2810,30 @@ void arc_dispatch(Arm64Ctx* c, uint64_t target) {
   // body. A native import reached through the dispatcher is a leaf from the
   // guest's point of view; pushing it would put host addresses in a chain the
   // watchdog maps against guest images.
-  if (g_dispatch)
-    g_dispatch(c, target);
-  else
-    arc_dispatch_miss(c, target);
+  /* A dispatched call that returns 7 has just reported _URC_INSTALL_CONTEXT:
+     the unwinder is about to resume in another frame, and the next indirect
+     call is the register restore that performs it. That call returns with sp
+     above where it started, because the frame it restored is an ancestor. */
+  if (g_try_on < 0) ArcTryEnabled();
+  {
+    uint64_t ask_sp = 0;
+    int asks_install = 0;
+    if (g_try_on) {
+      ask_sp = c->sp;
+      asks_install = t_try_armed;
+      t_try_armed = 0;
+    }
+    if (g_dispatch)
+      g_dispatch(c, target);
+    else
+      arc_dispatch_miss(c, target);
+    if (g_try_on) {
+      if (asks_install && c->sp > ask_sp)
+        arc_try_escape(c);
+      else if ((uint32_t)c->x[0] == 7)
+        t_try_armed = 1;
+    }
+  }
   if (watch) arc_watch_report("back", c, target, sret);
   t_current_guest_context = previous_guest;
 }
@@ -2670,9 +2946,30 @@ static void ArcTrapDump(Arm64Ctx* c) {
   fprintf(stderr, "\n[regs]  x29=%#llx x30=%#llx sp=%#llx\n",
           (unsigned long long)c->x[29], (unsigned long long)c->x[30],
           (unsigned long long)c->sp);
+  // The dispatcher's shadow records the lifted functions this thread entered,
+  // most recent first, each as an image index and an offset -- the only form
+  // that can be read back as a method name. A trap inside the runtime is
+  // reached from a guest method a few calls up, and this is where that method
+  // is, even though an interpreted frame cannot be unwound.
+  arc_shadow_report("trap");
   if (!getenv("ARC_TRAP_DUMP")) {
     fflush(stderr);
     return;
+  }
+  // The guest keeps a frame-pointer chain as well, and it is the only thing
+  // that names callers the dispatcher never saw: a direct `bl` does not pass
+  // through it. Walk it until it stops making sense.
+  {
+    uint64_t fp = c->x[29];
+    for (int depth = 0; depth < 48; ++depth) {
+      if (!fp || (fp & 7) || !ArcCommitted(fp, 16)) break;
+      const uint64_t prev = *(const uint64_t*)(uintptr_t)fp;
+      const uint64_t ret = *(const uint64_t*)(uintptr_t)(fp + 8);
+      fprintf(stderr, "[trapfp] %2d fp=%#llx ret=%#llx\n", depth,
+              (unsigned long long)fp, (unsigned long long)ret);
+      if (prev <= fp) break;
+      fp = prev;
+    }
   }
   // The frame the failed branch was computed in. A target read out of a struct
   // is only diagnosable alongside the slots that held the struct and its

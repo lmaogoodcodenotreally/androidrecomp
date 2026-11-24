@@ -245,6 +245,114 @@ struct Entry {
 // as you play.
 std::atomic<int> g_leak_state{-1};  // -1 undecided, 1 leaking, 0 recycling
 
+// A free of a block the heap no longer knows about is a double free, and the
+// heap's own reaction to one -- 0xc0000374, which ends the process -- arrives
+// after the fact: it cannot say which block was freed twice or who asked. The
+// question "is this still an allocated block" can be asked first instead.
+// `malloc` here is the CRT's, and the CRT's heap is the process heap, so
+// HeapValidate answers it in about ten nanoseconds for a block that is still
+// allocated (only the bogus case costs real time, and that one happens once
+// per bug). A block it rejects is skipped and named.
+//
+// This does not fix the double free; it makes it visible, survivable, and
+// cheap. ARC_FREE_GUARD=0 turns it off.
+
+// The exception object the last transferred throw landed with. Published so a
+// free of that block can be named rather than guessed at from a heap report.
+extern "C" uint64_t arc_eh_object(void);
+
+namespace {
+
+bool FreeGuardEnabled() {
+  static const bool on = [] {
+    const char* s = getenv("ARC_FREE_GUARD");
+    return !(s && s[0] == '0' && s[1] == 0);
+  }();
+  return on;
+}
+
+bool BlockStillAllocated(void* p) {
+  return HeapValidate(GetProcessHeap(), 0, p) != 0;
+}
+
+bool IsCaughtExceptionBlock(void* p) {
+  const uint64_t object = arc_eh_object();
+  if (!object) return false;
+  const uint64_t here = reinterpret_cast<uint64_t>(p);
+  return here + 0x100 >= object && here <= object;
+}
+
+// The free that matters is the one that came first, and the guard only ever
+// sees the second. So the last frees are kept -- pointer, caller, thread -- and
+// when the guard rejects a block the history is searched for earlier frees of
+// it. One atomic increment and three stores per free, no lock, no allocation:
+// a run with ARC_FREE_HISTORY=1 measures the same as one without.
+// ARC_FREE_HISTORY=1 turns it on.
+struct FreeEvent {
+  void* block;
+  void* from;
+  unsigned long tid;
+};
+
+constexpr size_t kFreeHistory = 1u << 16;
+FreeEvent g_free_history[kFreeHistory];
+std::atomic<uint64_t> g_free_count{0};
+
+bool FreeHistoryEnabled() {
+  static const bool on = getenv("ARC_FREE_HISTORY") != nullptr;
+  return on;
+}
+
+void FreeHistoryRecord(void* p) {
+  const uint64_t n = g_free_count.fetch_add(1, std::memory_order_relaxed);
+  FreeEvent& e = g_free_history[n & (kFreeHistory - 1)];
+  e.block = p;
+  e.from = _ReturnAddress();
+  e.tid = GetCurrentThreadId();
+}
+
+// "mkt_host.exe+0x1234" for an address inside this image, the module and offset
+// for another one, and the raw address when neither answers.
+void DescribeFreeCaller(void* address, char* out, size_t size) {
+  HMODULE mod = nullptr;
+  if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          static_cast<LPCSTR>(address), &mod) ||
+      !mod) {
+    _snprintf_s(out, size, _TRUNCATE, "%p", address);
+    return;
+  }
+  char path[MAX_PATH] = {0};
+  GetModuleFileNameA(mod, path, MAX_PATH);
+  const char* name = strrchr(path, '\\');
+  name = name ? name + 1 : path;
+  _snprintf_s(out, size, _TRUNCATE, "%s+%#llx", name[0] ? name : "?",
+              static_cast<unsigned long long>(
+                  reinterpret_cast<uintptr_t>(address) -
+                  reinterpret_cast<uintptr_t>(mod)));
+}
+
+void ReportFreeHistory(void* p) {
+  if (!FreeHistoryEnabled()) return;
+  const uint64_t seen = g_free_count.load(std::memory_order_relaxed);
+  const uint64_t first = seen > kFreeHistory ? seen - kFreeHistory : 0;
+  unsigned found = 0;
+  for (uint64_t i = first; i < seen; ++i) {
+    const FreeEvent& e = g_free_history[i & (kFreeHistory - 1)];
+    if (e.block != p || e.from == nullptr) continue;
+    char caller[160];
+    DescribeFreeCaller(e.from, caller, sizeof caller);
+    fprintf(stderr, "[free] earlier free #%llu by tid %lu from %s\n",
+            static_cast<unsigned long long>(i), e.tid, caller);
+    if (++found >= 8) break;
+  }
+  if (!found) fprintf(stderr, "[free] no earlier free in the last %u\n",
+                      static_cast<unsigned>(kFreeHistory));
+  fflush(stderr);
+}
+
+}  // namespace
+
 void ArcFree(void* p) {
   int state = g_leak_state.load(std::memory_order_relaxed);
   if (state < 0) {
@@ -252,6 +360,35 @@ void ArcFree(void* p) {
     g_leak_state.store(state, std::memory_order_relaxed);
   }
   if (state == 1) return;
+  if (FreeHistoryEnabled()) FreeHistoryRecord(p);
+  if (FreeGuardEnabled() && p && !BlockStillAllocated(p)) {
+    static std::atomic<int> reported{0};
+    if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+      fprintf(stderr, "[free] block not allocated: %p%s\n", p,
+              IsCaughtExceptionBlock(p) ? " (the caught exception)" : "");
+      // The heap's bookkeeping for a live block starts at p-0x10. A header that
+      // still says "in use, this size" means the block was freed through some
+      // path that bypassed this one; a header full of something else means it
+      // was written past.
+      const uint64_t* header = reinterpret_cast<const uint64_t*>(p) - 4;
+      fprintf(stderr, "[free] header %p:", static_cast<const void*>(header));
+      for (int i = 0; i < 6; ++i)
+        fprintf(stderr, " %016llx",
+                static_cast<unsigned long long>(header[i]));
+      fprintf(stderr, "\n");
+      ReportFreeHistory(p);
+      fflush(stderr);
+    }
+    return;
+  }
+  {
+    static const bool trace = getenv("ARC_FREE_TRACE") != nullptr;
+    if (trace && IsCaughtExceptionBlock(p)) {
+      fprintf(stderr, "[free] exception block %p (object %p)\n", p,
+              reinterpret_cast<void*>(arc_eh_object()));
+      fflush(stderr);
+    }
+  }
   free(p);
 }
 

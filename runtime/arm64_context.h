@@ -73,6 +73,18 @@ int64_t arc_svc(Arm64Ctx* c);
 // record the exact chain on the way in and drop it on the way out.
 void arc_shadow_push(uint64_t address);
 void arc_shadow_pop(void);
+
+// C++ exception transfer. A throw that is caught in an outer guest frame is a
+// non-local jump, which on this host would have to abandon host frames that
+// stand for guest frames. Each function whose FDE carries an LSDA therefore
+// anchors its own frame on entry and names its landing pads, so the transfer is
+// a `longjmp` to the frame that owns the pad and a `goto` to the pad itself.
+// arc_try_enter returns 0 for a normal entry and 1 when control was transferred
+// into this frame; the token names the anchor for arc_try_leave.
+int arc_try_enter(uint32_t* token, uint64_t fn, Arm64Ctx* c);
+void arc_try_leave(uint32_t token);
+uint64_t arc_try_resume(Arm64Ctx* c);
+void arc_try_failed(void);
 size_t arc_main_shadow_depth(void);
 uint64_t arc_main_shadow_at(size_t back);
 
