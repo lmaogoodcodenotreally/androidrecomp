@@ -22,6 +22,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
@@ -145,6 +146,25 @@ bool GuestReadable(uint64_t address, size_t size) {
   return arc::GuestRangeReadable(address, size);
 }
 
+// A syscall that writes through a guest pointer has to answer EFAULT when the
+// pointer is not mapped, not take a host fault inside nativeRender. Linux does
+// this at the syscall boundary; without it a guest passing 1 for a timespec
+// loses the frame and the only evidence is a host access violation. The probe
+// is the cached one, so the ordinary case stays two comparisons.
+static bool GuestWriteTarget(uint64_t address, size_t size, const char* what,
+                             const Arm64Ctx* c) {
+  if (GuestReadable(address, size)) return true;
+  static std::atomic<int> shown{0};
+  if (shown.fetch_add(1) < 8)
+    fprintf(stderr,
+            "[svc] %s invalid target=%#llx size=%zu nr=%llu lr=%#llx sp=%#llx\n",
+            what, static_cast<unsigned long long>(address), size,
+            static_cast<unsigned long long>(c->x[8]),
+            static_cast<unsigned long long>(c->x[30]),
+            static_cast<unsigned long long>(c->sp));
+  return false;
+}
+
 int64_t FutexWait(uint64_t address, uint32_t expected, int64_t timeout_ns) {
   auto* word = reinterpret_cast<volatile uint32_t*>(address);
   // A guest null or unmapped futex word is a guest fault, not a host one. The
@@ -258,6 +278,7 @@ extern "C" int64_t arc_svc(Arm64Ctx* c) {
 
   switch (nr) {
     case 56: {  // openat(dirfd, path, flags, mode)
+      if (!GuestWriteTarget(a1, 1, "openat/path", c)) return -14;
       const auto fn = Lookup<OpenFn>("open");
       if (!fn) return -38;  // ENOSYS
       const int fd = fn(reinterpret_cast<const char*>(a1), static_cast<int>(a2),
@@ -277,6 +298,7 @@ extern "C" int64_t arc_svc(Arm64Ctx* c) {
       return r < 0 ? NegErrno() : r;
     }
     case 63: {  // read(fd, buf, count)
+      if (!GuestWriteTarget(a1, static_cast<size_t>(a2), "read", c)) return -14;
       const auto fn = Lookup<ReadFn>("read");
       if (!fn) return -38;
       const int64_t r =
@@ -291,6 +313,9 @@ extern "C" int64_t arc_svc(Arm64Ctx* c) {
       return r < 0 ? NegErrno() : r;
     }
     case 79: {  // newfstatat(dirfd, path, buf, flags)
+      if (!GuestWriteTarget(a1, 1, "newfstatat/path", c) ||
+          !GuestWriteTarget(a2, 128, "newfstatat/buf", c))
+        return -14;
       const auto fn = Lookup<StatFn>("stat");
       if (!fn) return -38;
       const int r = fn(reinterpret_cast<const char*>(a1),
@@ -298,6 +323,7 @@ extern "C" int64_t arc_svc(Arm64Ctx* c) {
       return r == 0 ? 0 : NegErrno();
     }
     case 80: {  // fstat(fd, buf)
+      if (!GuestWriteTarget(a1, 128, "fstat", c)) return -14;
       const auto fn = Lookup<FstatFn>("fstat");
       if (!fn) return -38;
       const int r = fn(static_cast<int>(a0), reinterpret_cast<void*>(a1));
@@ -305,6 +331,8 @@ extern "C" int64_t arc_svc(Arm64Ctx* c) {
     }
     case 98: {  // futex(uaddr, op, value, timeout, uaddr2, value3)
       if (!GuestReadable(a0, sizeof(uint32_t))) {
+        // FutexRequeue and the compare-and-requeue form write through this
+        // pointer too, so an unmapped word must be refused before the switch.
         fprintf(stderr,
                 "[svc] futex invalid uaddr=%#llx op=%#llx value=%#llx "
                 "timeout=%#llx lr=%#llx sp=%#llx x19=%#llx x20=%#llx "
@@ -318,6 +346,7 @@ extern "C" int64_t arc_svc(Arm64Ctx* c) {
                 static_cast<unsigned long long>(c->x[19]),
                 static_cast<unsigned long long>(c->x[20]),
                 static_cast<unsigned long long>(c->x[21]));
+        return -14;  // EFAULT, as the kernel would answer
       }
       // The low seven bits are the command; the upper bits are modifiers
       // (FUTEX_PRIVATE_FLAG, FUTEX_CLOCK_REALTIME). A private futex only
@@ -433,6 +462,8 @@ extern "C" int64_t arc_svc(Arm64Ctx* c) {
       return result;
     }
     case 113: {  // clock_gettime(clockid, timespec*)
+      if (!GuestWriteTarget(a1, sizeof(GuestTimespec), "clock_gettime", c))
+        return -14;
       auto* ts = reinterpret_cast<GuestTimespec*>(a1);
       if (!ts) return -14;  // EFAULT
       const int clock = static_cast<int>(a0);
@@ -453,6 +484,7 @@ extern "C" int64_t arc_svc(Arm64Ctx* c) {
     case 135:  // rt_sigprocmask
       return 0;
     case 169: {  // gettimeofday(timeval*, timezone*)
+      if (!GuestWriteTarget(a0, 16, "gettimeofday", c)) return -14;
       const auto fn = Lookup<TimeFn>("gettimeofday");
       if (!fn) return -38;
       return fn(reinterpret_cast<void*>(a0), reinterpret_cast<void*>(a1)) == 0
@@ -468,6 +500,8 @@ extern "C" int64_t arc_svc(Arm64Ctx* c) {
       return static_cast<int64_t>(syscall(SYS_gettid));
 #endif
     case 278:  // getrandom(buf, len, flags)
+      if (!GuestWriteTarget(a0, static_cast<size_t>(a1), "getrandom", c))
+        return -14;
       arc::ShimFillRandom(reinterpret_cast<void*>(a0),
                           static_cast<size_t>(a1));
       return static_cast<int64_t>(a1);

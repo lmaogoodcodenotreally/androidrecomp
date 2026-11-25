@@ -2103,12 +2103,7 @@ static ARC_THREAD_LOCAL uint64_t t_dispatch_pc;
 
    The same shape as arc_longjmp above: guest state is authoritative and the
    host stack is disposable. */
-/* Each anchor costs about 460 bytes of thread-local storage, and the depth that
-   matters is the host call depth of anchored functions -- a tail call keeps its
-   caller's host frame alive, so a 200-iteration tail-recursive loop nests 200
-   anchors even though the guest stack does not move. 4096 leaves room for that
-   without letting a runaway loop quietly eat the address space. */
-#define ARC_TRY_MAX 4096
+#define ARC_TRY_MAX 512
 typedef struct {
   jmp_buf host;
   Arm64Ctx* ctx;
@@ -2143,13 +2138,6 @@ typedef struct {
 
 static ARC_THREAD_LOCAL ArcTryAnchor t_try[ARC_TRY_MAX];
 static ARC_THREAD_LOCAL int t_try_depth;
-/* Entry/leave accounting for the anchor stack. A depth above ARC_TRY_MAX is
-   either real nesting or anchors that were never popped -- a frame returning
-   out of order makes every frame above it leak -- and the two look nothing
-   alike once the stack is printed, so the trap carries the whole array. */
-static ARC_THREAD_LOCAL unsigned long long t_try_enters;
-static ARC_THREAD_LOCAL unsigned long long t_try_leaves;
-static ARC_THREAD_LOCAL unsigned long long t_try_mismatch;
 static ARC_THREAD_LOCAL int t_try_armed;
 static ARC_THREAD_LOCAL Arm64Ctx t_try_state;
 static ARC_THREAD_LOCAL uint64_t t_try_state_shadow;
@@ -2174,32 +2162,11 @@ static int ArcTryEnabled(void) {
 
 int arc_try_enter(uint32_t* token, uint64_t fn, Arm64Ctx* c) {
   ArcTryAnchor* a;
-  // Every function that carries an LSDA now calls this on entry. With ARC_EH=0
-  // the anchor is skipped outright, which makes the cost of the mechanism
-  // measurable against the same binary instead of against an older one. The
-  // token still has to be written: the body's arc_try_leave compares it.
-  if (g_try_on < 0) ArcTryEnabled();
-  if (!g_try_on) {
-    *token = 0xFFFFFFFFu;
-    return 0;
-  }
   if (t_try_depth >= ARC_TRY_MAX) {
-    int i;
-    fprintf(stderr,
-            "[eho] depth=%d enters=%llu leaves=%llu mismatch=%llu\n",
-            t_try_depth, t_try_enters, t_try_leaves, t_try_mismatch);
-    for (i = 0; i < t_try_depth; ++i) {
-      fprintf(stderr, "[eho] %3d fn=%#llx entry_sp=%#llx token=%u ctx=%p\n", i,
-              (unsigned long long)t_try[i].fn,
-              (unsigned long long)t_try[i].entry_sp, t_try[i].token,
-              (void*)t_try[i].ctx);
-    }
-    fflush(stderr);
     arc_trap(c, "inner exception frames exceed ARC_TRY_MAX");
     return 0;
   }
   a = &t_try[t_try_depth];
-  ++t_try_enters;
   a->ctx = c;
   a->fn = fn;
   a->entry_sp = c->sp;
@@ -2237,27 +2204,7 @@ int arc_try_enter(uint32_t* token, uint64_t fn, Arm64Ctx* c) {
 }
 
 void arc_try_leave(uint32_t token) {
-  if (token == 0xFFFFFFFFu) return;  // EH off: nothing was anchored
-  ++t_try_leaves;
-  if (t_try_depth > 0 && t_try[t_try_depth - 1].token == token) {
-    --t_try_depth;
-    return;
-  }
-  ++t_try_mismatch;
-  if (t_try_mismatch <= 40) {
-    const int top = t_try_depth - 1;
-    fprintf(stderr,
-            "[ehm] token=%u depth=%d top_token=%d fn=%#llx top_fn=%#llx "
-            "sp=%#llx now_sp=%#llx\n",
-            token, t_try_depth, top >= 0 ? (int)t_try[top].token : -1,
-            token < t_try_depth ? (unsigned long long)t_try[token].fn : 0,
-            top >= 0 ? (unsigned long long)t_try[top].fn : 0,
-            token < t_try_depth ? (unsigned long long)t_try[token].entry_sp : 0,
-            (unsigned long long)(t_current_guest_context
-                                     ? t_current_guest_context->sp
-                                     : 0));
-    fflush(stderr);
-  }
+  if (t_try_depth > 0 && t_try[t_try_depth - 1].token == token) --t_try_depth;
 }
 
 uint64_t arc_try_resume(Arm64Ctx* c) {

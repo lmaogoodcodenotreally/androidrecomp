@@ -1314,6 +1314,13 @@ const MethodFlag kMethodFlags[] = {
     // no request is made, so nothing can fail informatively. Here the
     // environment is a fixed loopback address that is always available.
     {"isDataAvailable", true},
+    // There is no Play Core on this host and no Play Asset Delivery service to
+    // report pack state or call a download listener back. Answering false says
+    // the service exists, after which the engine registers a listener and waits
+    // for a status callback that nothing will ever deliver -- the download screen
+    // holds at zero with the catalog already on disk. This is the same answer a
+    // device without Play Core gives, and it selects Unity's own HTTP path.
+    {"playCoreApiMissing", true},
 };
 
 // Tri-state on purpose: "not in the table" has to stay distinguishable from
