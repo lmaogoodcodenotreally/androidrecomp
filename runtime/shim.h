@@ -208,6 +208,23 @@ bool ShimGuestPath(const char* guest, char* out, size_t size);
 uint64_t ShimResolveSys(const char* name);
 size_t ShimSysCount();
 
+// Whether a guest span is committed and readable right now.
+//
+// This is `VirtualQuery`, which is a kernel call, and the places that need the
+// answer sit on the engine's hottest waits: every condition-variable wait
+// probes the object it is waiting on, and every futex wait probes its word.
+// Those are the same few arenas asked about over and over -- a job worker waits
+// on its own condition a thousand times a second -- so the answer is kept per
+// thread by *region*, which is what VirtualQuery reports anyway. A region only
+// stops being readable when this port releases or decommits it, and those paths
+// call GuestMemoryReleased, which drops every cached region on the next probe.
+bool GuestRangeReadable(uint64_t address, size_t size);
+
+// Guest memory was released or its protection changed: cached readability
+// answers are no longer trustworthy. Cheap, and only called by the mapping
+// entry points.
+void GuestMemoryReleased();
+
 // The guest ending the process. Reported rather than allowed to happen quietly,
 // so that a title which decides it cannot continue is distinguishable from a
 // lifter bug. Both the library call and the raw `exit_group` syscall come

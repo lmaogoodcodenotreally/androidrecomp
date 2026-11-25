@@ -19,6 +19,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -1055,6 +1056,8 @@ int Munmap(void* addr, uint64_t length) {
   if (getenv("ARC_TRACE_MMAP"))
     fprintf(stderr, "[munmap] %p %#llx\n", addr,
             static_cast<unsigned long long>(length));
+  // Whatever this releases, a cached "readable" answer about it is now a lie.
+  arc::GuestMemoryReleased();
 #if defined(_WIN32)
   if (!addr) return -1;
   const uintptr_t at = reinterpret_cast<uintptr_t>(addr);
@@ -1089,6 +1092,7 @@ int Munmap(void* addr, uint64_t length) {
 }
 
 int Mprotect(void* addr, uint64_t length, int) {
+  arc::GuestMemoryReleased();
 #if defined(_WIN32)
   if (!addr || !length) return 0;
   // mmap may have reserved the range inaccessible; mprotect is how the guest

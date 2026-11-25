@@ -345,13 +345,11 @@ bool FakeVsync(uint32_t* c) {
   static int shown = 0;
   const bool trace = getenv("ARC_TRACE_COND") != nullptr;
   const uintptr_t owner = reinterpret_cast<uintptr_t>(c) - 0x88;
-  MEMORY_BASIC_INFORMATION mbi;
-  if (!VirtualQuery(reinterpret_cast<const void*>(owner), &mbi, sizeof mbi) ||
-      mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) ||
-      !(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                       PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
-                       PAGE_EXECUTE_WRITECOPY)))
-    return false;
+  // This runs on *every* condition-variable wait in the guest, and it is the
+  // hot path a spinning worker takes: 0.9 of a core was once spent in the two
+  // VirtualQuery calls below. The probe caches the region, so the common case
+  // is two comparisons.
+  if (!arc::GuestRangeReadable(owner, 0x60)) return false;
   uint64_t record = 0;
   memcpy(&record, reinterpret_cast<const void*>(owner + 0x58), sizeof record);
   if (trace && record && shown < 40) {
@@ -364,15 +362,7 @@ bool FakeVsync(uint32_t* c) {
             static_cast<unsigned long long>(record));
   }
   if (!record || (record & 7)) return false;
-  if (!VirtualQuery(reinterpret_cast<const void*>(record), &mbi, sizeof mbi) ||
-      mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) ||
-      !(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                       PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
-                       PAGE_EXECUTE_WRITECOPY)))
-    return false;
-  if (record + 16 > reinterpret_cast<uintptr_t>(mbi.BaseAddress) +
-                       mbi.RegionSize)
-    return false;
+  if (!arc::GuestRangeReadable(record, 16)) return false;
   uint64_t frame[2] = {};
   memcpy(frame, reinterpret_cast<const void*>(record), sizeof frame);
   if (trace && shown <= 40)
@@ -426,12 +416,7 @@ bool FakeUnityClock(uint32_t* c, uint32_t* m) {
     return false;
   uint64_t* now = reinterpret_cast<uint64_t*>(
       reinterpret_cast<uintptr_t>(m) + 0x58);
-  MEMORY_BASIC_INFORMATION mbi;
-  if (!VirtualQuery(now, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
-      (mbi.Protect & PAGE_GUARD) ||
-      !(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                       PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
-                       PAGE_EXECUTE_WRITECOPY)))
+  if (!arc::GuestRangeReadable(reinterpret_cast<uintptr_t>(now), 8))
     return false;
   const uint64_t target = ctx->x[19];
   // The engine's frame clock is an absolute time in seconds, and a frame step
@@ -776,6 +761,9 @@ void FreeGuestStack(void* p) {
 #else
   free(p);
 #endif
+  // A guest stack that has gone back to the system must not keep answering
+  // "readable" from a thread-local probe cache.
+  if (p) arc::GuestMemoryReleased();
 }
 
 void RunGuestThread(GuestThreadStart* s) {

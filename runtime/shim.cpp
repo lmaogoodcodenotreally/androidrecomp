@@ -826,6 +826,64 @@ uint64_t ShimResolve(const char* name) {
 
 size_t ShimExplicitCount() { return sizeof(kExplicit) / sizeof(kExplicit[0]); }
 
+// --- cached readability probes ---------------------------------------------
+//
+// Measured on this port with the title parked on the download screen: one
+// thread spent 0.92 of a core inside NtQueryVirtualMemory, and the same was
+// true of the load phase before it. Two condition-variable waits and one futex
+// wait each asked about memory that had not moved since the previous call.
+//
+// Region granularity is the point. VirtualQuery answers for a whole committed
+// allocation, so a worker alternating between its condition variable, the
+// frame record beside it and the futex word inside it hits the same two or
+// three entries forever. Four per thread covers that; replacement is
+// round-robin, and a miss simply asks the kernel again.
+namespace {
+
+struct GuestProbe {
+  uintptr_t base;
+  uintptr_t end;
+  uint32_t generation;
+};
+
+thread_local GuestProbe g_probes[4];
+thread_local unsigned g_probe_next;
+
+std::atomic<uint32_t> g_memory_generation{1};
+
+}  // namespace
+
+void GuestMemoryReleased() {
+  g_memory_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool GuestRangeReadable(uint64_t address, size_t size) {
+#if defined(_WIN32)
+  if (!address || !size) return false;
+  const uint64_t end = address + size;
+  if (end < address) return false;
+  const uint32_t generation = g_memory_generation.load(std::memory_order_relaxed);
+  for (const GuestProbe& p : g_probes)
+    if (p.generation == generation && address >= p.base && end <= p.end)
+      return true;
+  MEMORY_BASIC_INFORMATION mbi;
+  if (!VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof mbi))
+    return false;
+  if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) return false;
+  if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                       PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                       PAGE_EXECUTE_WRITECOPY)))
+    return false;
+  const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+  const uintptr_t limit = base + mbi.RegionSize;
+  if (end > limit) return false;
+  g_probes[g_probe_next++ & 3] = GuestProbe{base, limit, generation};
+  return true;
+#else
+  return address != 0 && size != 0;
+#endif
+}
+
 uint64_t ShimHandOut(uint64_t address, const char* name) {
   if (!address) return 0;
   // The dispatcher keeps the name pointer rather than a copy of the string,

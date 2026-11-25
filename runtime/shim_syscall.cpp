@@ -139,23 +139,10 @@ int64_t FutexTimeoutNs(uint64_t address, bool absolute, bool realtime) {
 }
 
 bool GuestReadable(uint64_t address, size_t size) {
-#if defined(_WIN32)
-  if (!address || !size) return false;
-  MEMORY_BASIC_INFORMATION mbi;
-  if (!VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof mbi))
-    return false;
-  if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) return false;
-  if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                       PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
-                       PAGE_EXECUTE_WRITECOPY)))
-    return false;
-  const uint64_t end = reinterpret_cast<uint64_t>(mbi.BaseAddress) +
-                       mbi.RegionSize;
-  return address <= end && size <= end - address;
-#else
-  (void)size;
-  return address != 0;
-#endif
+  // Every futex wait asks this, and a spinning wait asks it hundreds of
+  // thousands of times a second about the same word. The shared probe keeps
+  // the region it last validated, per thread.
+  return arc::GuestRangeReadable(address, size);
 }
 
 int64_t FutexWait(uint64_t address, uint32_t expected, int64_t timeout_ns) {

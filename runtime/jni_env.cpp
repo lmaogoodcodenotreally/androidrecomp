@@ -440,6 +440,12 @@ void NoteUnanswered(const char* name) {
   for (const std::string& s : g_method_unanswered)
     if (s == name) return;
   g_method_unanswered.push_back(name);
+  // The report at the end of a run lists these, and a title that is parked on
+  // a download never gets to the end of a run. Naming each one the first time
+  // it is asked turns "stuck at 0%" into "Java was asked for this and got a
+  // blank", which is the whole question when Java is not here.
+  static const bool trace = getenv("ARC_TRACE_JNI_MISS") != nullptr;
+  if (trace) fprintf(stderr, "[jni] no answer for %s\n", name);
 }
 
 // Every method actually invoked, as opposed to merely looked up. The
