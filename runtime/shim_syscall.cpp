@@ -364,7 +364,8 @@ extern "C" int64_t arc_svc(Arm64Ctx* c) {
       const uint32_t command = static_cast<uint32_t>(a1) & kCommandMask;
       const uint32_t value = static_cast<uint32_t>(a2);
       static std::atomic<int> traced{0};
-      if (getenv("ARC_FUTEX_TRACE") && traced.fetch_add(1) < 24)
+      static const bool tracing = getenv("ARC_FUTEX_TRACE") != nullptr;
+      if (tracing && traced.fetch_add(1) < 24)
         fprintf(stderr,
                 "[futex] op=%#llx uaddr=%#llx val=%#llx timeout=%#llx "
                 "uaddr2=%#llx value3=%#llx\n",
@@ -374,7 +375,7 @@ extern "C" int64_t arc_svc(Arm64Ctx* c) {
                 static_cast<unsigned long long>(a3),
                 static_cast<unsigned long long>(a4),
                 static_cast<unsigned long long>(a5));
-      const bool trace = getenv("ARC_FUTEX_TRACE") != nullptr;
+      const bool trace = tracing;
       const auto started = trace ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
       int64_t result = 0;

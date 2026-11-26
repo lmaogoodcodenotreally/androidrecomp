@@ -295,8 +295,15 @@ int CondattrInit(void* attr) {
 int CondattrDestroy(void*) { return 0; }
 int CondattrSetclock(void*, int) { return 0; }
 
+// A condition wait happens millions of times a second in the job system, and
+// getenv takes the CRT's environment lock on every call. Read the flag once.
+static bool TraceCond() {
+  static const bool on = getenv("ARC_TRACE_COND") != nullptr;
+  return on;
+}
+
 void TraceCondOp(const char* op, uint32_t* c) {
-  if (!getenv("ARC_TRACE_COND")) return;
+  if (!TraceCond()) return;
   fprintf(stderr, "[cond] %s c=%p\n", op, (void*)c);
 }
 
@@ -343,7 +350,7 @@ bool FakeVsync(uint32_t* c) {
   static const bool enabled = getenv("ARC_FAKE_VSYNC") != nullptr;
   if (!enabled) return false;
   static int shown = 0;
-  const bool trace = getenv("ARC_TRACE_COND") != nullptr;
+  const bool trace = TraceCond();
   const uintptr_t owner = reinterpret_cast<uintptr_t>(c) - 0x88;
   // This runs on *every* condition-variable wait in the guest, and it is the
   // hot path a spinning worker takes: 0.9 of a core was once spent in the two

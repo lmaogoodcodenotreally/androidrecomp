@@ -434,6 +434,12 @@ char MethodReturnType(uint64_t id) {
   return close && close[1] ? close[1] : 0;
 }
 
+// Every JNI slot check used to call getenv, which locks the CRT environment
+// on each of the millions of calls a frame makes. Read the flag once.
+static bool TraceJni() {
+  static const bool on = std::getenv("ARC_TRACE_JNI") != nullptr;
+  return on;
+}
 void NoteUnanswered(const char* name) {
   if (!name) return;
   std::lock_guard<std::mutex> held(g_method_lock);
@@ -743,7 +749,7 @@ void EnsureTrustStore() {
         AllocateText("java/security/cert/X509Certificate"));
   g_trust_issuers = AllocateObjectArray(g_trust_cert_handles.data(),
                                         g_trust_cert_handles.size());
-  static const bool trace = std::getenv("ARC_TRACE_JNI") != nullptr;
+  static const bool trace = TraceJni();
   if (trace)
     std::fprintf(stderr, "[jni] trust store %s: %zu certificate(s)\n",
                  path ? path : "(none)", g_trust_certs.size());
@@ -1759,7 +1765,7 @@ void Handle(size_t index, Arm64Ctx* c) {
   // lookups is asking for something it never gets, and the only way to
   // know which thing is to read the names it asks by.
   {
-    static const bool trace = getenv("ARC_TRACE_JNI") != nullptr;
+    static const bool trace = TraceJni();
     if (trace) {
       const char* what = index == 6 ? "FindClass"
                        : index == 33 ? "GetMethodID"
@@ -1921,7 +1927,7 @@ void Handle(size_t index, Arm64Ctx* c) {
         }
       }
       const uint64_t made = AllocateText(text.c_str());
-      if (getenv("ARC_TRACE_JNI"))
+      if (TraceJni())
         fprintf(stderr, "[jni] NewString(%zu) -> %#llx text=\"%.60s\"\n", count,
                 static_cast<unsigned long long>(made),
                 reinterpret_cast<const char*>(made));
@@ -1941,7 +1947,7 @@ void Handle(size_t index, Arm64Ctx* c) {
         std::lock_guard<std::mutex> held(g_asset_text_lock);
         g_last_utf8 = reinterpret_cast<const char*>(c->x[1]);
       }
-      if (getenv("ARC_TRACE_JNI"))
+      if (TraceJni())
         fprintf(stderr, "[jni] NewStringUTF -> %#llx text=\"%.60s\"\n",
                 static_cast<unsigned long long>(made),
                 reinterpret_cast<const char*>(made));
@@ -1979,7 +1985,7 @@ void Handle(size_t index, Arm64Ctx* c) {
       // length and subtracts one gets -1, hands that to memcpy, and runs off
       // the end of the arena a long way from the call that caused it. Worth
       // being able to see which string was empty and which was not.
-      static const bool trace = getenv("ARC_TRACE_JNI") != nullptr;
+      static const bool trace = TraceJni();
       if (trace) {
         const char* s = reinterpret_cast<const char*>(c->x[1]);
         fprintf(stderr, "[jni] GetStringUTFChars %#llx %s \"%.48s\" lr=%#llx\n",
@@ -2227,7 +2233,7 @@ void Handle(size_t index, Arm64Ctx* c) {
         const char* signature =
             args.size() > (ctor ? 1u : 2u) ? HandleText(args[ctor ? 1 : 2])
                                            : nullptr;
-        if (getenv("ARC_TRACE_JNI")) {
+        if (TraceJni()) {
           uint64_t jv[4] = {};
           if (c->x[3]) memcpy(jv, reinterpret_cast<const void*>(c->x[3]), sizeof jv);
           fprintf(stderr,
@@ -2253,7 +2259,7 @@ void Handle(size_t index, Arm64Ctx* c) {
       if (name && strcmp(name, "open") == 0) {
         uint64_t arg = 0;
         std::string text;
-        if (getenv("ARC_TRACE_JNI")) {
+        if (TraceJni()) {
           struct VaProbe {
             uint64_t stack, gr_top, vr_top;
             int32_t gr_offs, vr_offs;
@@ -2313,7 +2319,7 @@ void Handle(size_t index, Arm64Ctx* c) {
         for (uint64_t candidate : candidates) {
           const std::string found =
               ReadAssetFile(reinterpret_cast<const char*>(candidate));
-          if (getenv("ARC_TRACE_JNI"))
+          if (TraceJni())
             fprintf(stderr, "[jni] open arg %#llx \"%.60s\" %s\n",
                     static_cast<unsigned long long>(candidate),
                     reinterpret_cast<const char*>(candidate),
@@ -2349,13 +2355,13 @@ void Handle(size_t index, Arm64Ctx* c) {
             std::lock_guard<std::mutex> held(g_asset_text_lock);
             g_last_asset_text = text;
           }
-          if (getenv("ARC_TRACE_JNI"))
+          if (TraceJni())
             fprintf(stderr, "[jni] open %s -> %zu bytes\n",
                     reinterpret_cast<const char*>(arg), text.size());
           c->x[0] = AllocateText(text.c_str());
           return;
         }
-        if (getenv("ARC_TRACE_JNI"))
+        if (TraceJni())
           fprintf(stderr, "[jni] open MISS arg=%#llx text=\"%.60s\"\n",
                   static_cast<unsigned long long>(arg),
                   arg ? reinterpret_cast<const char*>(arg) : "");
@@ -2370,7 +2376,7 @@ void Handle(size_t index, Arm64Ctx* c) {
         NoteCalled(name);
         std::lock_guard<std::mutex> held(g_asset_text_lock);
         const uint64_t made = AllocateText(g_last_asset_text.c_str());
-        if (getenv("ARC_TRACE_JNI"))
+        if (TraceJni())
           fprintf(stderr, "[jni] next -> %#llx (%zu bytes) text=\"%.60s\"\n",
                   static_cast<unsigned long long>(made), g_last_asset_text.size(),
                   reinterpret_cast<const char*>(made));
@@ -2392,7 +2398,7 @@ void Handle(size_t index, Arm64Ctx* c) {
           std::lock_guard<std::mutex> held(g_asset_text_lock);
           requested = g_last_utf8;
         }
-        static const bool trace = getenv("ARC_TRACE_JNI") != nullptr;
+        static const bool trace = TraceJni();
         if (trace)
           fprintf(stderr, "[jni] findLibrary \"%s\"\n", requested.c_str());
         const std::string path = LibraryPathFor(requested.c_str());
@@ -2438,7 +2444,7 @@ void Handle(size_t index, Arm64Ctx* c) {
         // Whether the object carries text at all is the question these turn
         // on: a handle we made for a string does, and one we handed back for
         // something we did not understand is a zeroed block that does not.
-        static const bool trace = getenv("ARC_TRACE_JNI") != nullptr;
+        static const bool trace = TraceJni();
         if (trace)
           fprintf(stderr, "[jni] %s on %#llx %s text=\"%.48s\"\n", name,
                   static_cast<unsigned long long>(which),
@@ -2598,7 +2604,7 @@ void Handle(size_t index, Arm64Ctx* c) {
       // the call names a method, and the arguments say what it was asked to
       // do. Printing the text ones costs little and turns "it called execute"
       // into the actual command.
-      if (getenv("ARC_TRACE_JNI")) {
+      if (TraceJni()) {
         const std::vector<uint64_t> shown = CallArgs(c, index, 4);
         for (size_t i = 0; i < shown.size(); ++i) {
           const char* text = HandleText(shown[i]);
@@ -2824,7 +2830,7 @@ void Handle(size_t index, Arm64Ctx* c) {
       if (methods && count > 0) {
         std::lock_guard<std::mutex> g(g_natives_lock);
         for (int i = 0; i < count; ++i) {
-          if (getenv("ARC_TRACE_JNI"))
+          if (TraceJni())
             fprintf(stderr, "[jni] RegisterNatives %s %s -> %#llx\n",
                     methods[i].name ? methods[i].name : "?",
                     methods[i].signature ? methods[i].signature : "?",
