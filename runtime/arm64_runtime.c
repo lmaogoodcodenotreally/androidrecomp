@@ -2111,6 +2111,13 @@ typedef struct {
   uint64_t entry_sp;
   uint64_t shadow;
   uint32_t token;
+  /* The landing pads this function's switch actually has, as image-relative
+     RVAs. The unwinder hands back an *absolute* guest address in x30, so a
+   transfer chosen by stack depth alone can land in a frame that has no case
+   for that pad -- and the guest then resumes with a half-restored context.
+   Match on the pads themselves and hand the switch back the RVA it expects. */
+  const uint64_t* pads;
+  int pad_count;
   /* The frame the jump returns into is still live but *abandoned*, and the
      function that owns it keeps making calls: every call writes its return
      address to the same slot the anchor's own return address lives in, and the
@@ -2160,7 +2167,8 @@ static int ArcTryEnabled(void) {
   return g_try_on;
 }
 
-int arc_try_enter(uint32_t* token, uint64_t fn, Arm64Ctx* c) {
+int arc_try_enter(uint32_t* token, uint64_t fn, Arm64Ctx* c,
+                  const uint64_t* pads, int pad_count) {
   ArcTryAnchor* a;
   if (t_try_depth >= ARC_TRY_MAX) {
     arc_trap(c, "inner exception frames exceed ARC_TRY_MAX");
@@ -2169,6 +2177,8 @@ int arc_try_enter(uint32_t* token, uint64_t fn, Arm64Ctx* c) {
   a = &t_try[t_try_depth];
   a->ctx = c;
   a->fn = fn;
+  a->pads = pads;
+  a->pad_count = pads ? pad_count : 0;
   a->entry_sp = c->sp;
   a->shadow = (uint64_t)t_shadow_depth;
   a->token = (uint32_t)t_try_depth;
@@ -2279,19 +2289,58 @@ static void arc_try_transfer(const jmp_buf buf) {
 
 /* The unwinder just installed a handler context. Move control to the frame that
    owns the pad it chose. */
+/* The unwinder restores a real guest address into x30, while the generated
+   switch compares against an image-relative RVA. Return the RVA only when this
+   anchor's own pad table contains the address. */
+static int AnchorPadRva(const ArcTryAnchor* a, uint64_t address,
+                        uint64_t* rva) {
+  int i, img;
+  if (!a->pads) return 0;
+  for (i = 0; i < a->pad_count; ++i) {
+    const uint64_t p = a->pads[i];
+    if (address == p) { *rva = p; return 1; }
+    /* ARC_IMAGE_COUNT in the generated header is 7; this file only has the
+       unsized array declaration, so keep the bound here in step with it. */
+    for (img = 0; img < 7; ++img) {
+      const uint64_t base = arc_image_bases[img];
+      if (base && address == base + p) { *rva = p; return 1; }
+    }
+  }
+  return 0;
+}
+
 static void arc_try_escape(Arm64Ctx* c) {
   const uint64_t pad = c->x[30];
   int i;
+  uint64_t rva = 0;
+  int chosen = -1;
+  /* Stack depth alone cannot name the frame that owns the pad: several
+     anchored callers can sit above the restored sp. Ask every candidate
+     whether the pad is a case its switch can actually resume. */
   for (i = t_try_depth - 1; i >= 0; --i) {
     const ArcTryAnchor* a = &t_try[i];
     if (a->entry_sp <= c->sp) continue;
     if (a->entry_sp > c->sp + UINT64_C(0x100000)) continue;
     if (a->ctx != c) continue;
+    if (AnchorPadRva(a, pad, &rva)) { chosen = i; break; }
+  }
+  if (chosen < 0) {
+    fprintf(stderr, "[eh] no anchored frame owns pad=%#llx sp=%#llx depth=%d\n",
+            (unsigned long long)pad, (unsigned long long)c->sp, t_try_depth);
+    for (i = t_try_depth - 1; i >= 0; --i)
+      fprintf(stderr, "[eh]   candidate %d fn=%#llx sp=%#llx pads=%d\n", i,
+              (unsigned long long)t_try[i].fn,
+              (unsigned long long)t_try[i].entry_sp, t_try[i].pad_count);
+    fflush(stderr);
+    return;
+  }
+  {
+    ArcTryAnchor* a = &t_try[chosen];
     t_try_state = *c;
     t_try_state_shadow = a->shadow;
-    t_try_pad = pad;
+    t_try_pad = rva;
     g_eh_object = t_try_state.x[0];
-    t_try_depth = i + 1;
+    t_try_depth = chosen + 1;
     if (g_try_log) t_eh_trace = 60;
     /* Put the abandoned frame back the way the anchor left it. */
     {
@@ -2315,21 +2364,20 @@ static void arc_try_escape(Arm64Ctx* c) {
       const _JUMP_BUFFER* saved = (const _JUMP_BUFFER*)a->host;
       const NT_TIB* tib = (const NT_TIB*)NtCurrentTeb();
       fprintf(stderr,
-              "[eh] pad=%#llx frame=%#llx sp=%#llx entry=%#llx depth=%d/%d "
-              "host_sp=%#llx host_rip=%#llx now_sp=%#llx window=[%p,%p)\n",
-              (unsigned long long)pad, (unsigned long long)a->fn,
-              (unsigned long long)c->sp, (unsigned long long)a->entry_sp, i,
-              t_try_depth, (unsigned long long)saved->Rsp,
-              (unsigned long long)saved->Rip, (unsigned long long)(uintptr_t)_AddressOfReturnAddress(),
+              "[eh] pad=%#llx rva=%#llx frame=%#llx sp=%#llx entry=%#llx "
+              "depth=%d/%d host_sp=%#llx host_rip=%#llx now_sp=%#llx "
+              "window=[%p,%p)\n",
+              (unsigned long long)pad, (unsigned long long)rva,
+              (unsigned long long)a->fn, (unsigned long long)c->sp,
+              (unsigned long long)a->entry_sp, chosen, t_try_depth,
+              (unsigned long long)saved->Rsp, (unsigned long long)saved->Rip,
+              (unsigned long long)(uintptr_t)_AddressOfReturnAddress(),
               tib->StackLimit, tib->StackBase);
       fflush(stderr);
     }
-    if (getenv("ARC_EH_CRT")) longjmp(t_try[i].host, 1);
-    arc_try_transfer(t_try[i].host);
+    if (getenv("ARC_EH_CRT")) longjmp(a->host, 1);
+    arc_try_transfer(a->host);
   }
-  fprintf(stderr, "[eh] no anchored frame for pad=%#llx sp=%#llx depth=%d\n",
-          (unsigned long long)pad, (unsigned long long)c->sp, t_try_depth);
-  fflush(stderr);
 }
 
 /* --- data watch -----------------------------------------------------------

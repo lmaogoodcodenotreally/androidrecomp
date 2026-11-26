@@ -81,7 +81,8 @@ void arc_shadow_pop(void);
 // a `longjmp` to the frame that owns the pad and a `goto` to the pad itself.
 // arc_try_enter returns 0 for a normal entry and 1 when control was transferred
 // into this frame; the token names the anchor for arc_try_leave.
-int arc_try_enter(uint32_t* token, uint64_t fn, Arm64Ctx* c);
+int arc_try_enter(uint32_t* token, uint64_t fn, Arm64Ctx* c,
+                  const uint64_t* pads, int pad_count);
 void arc_try_leave(uint32_t token);
 uint64_t arc_try_resume(Arm64Ctx* c);
 void arc_try_failed(void);
