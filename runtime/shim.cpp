@@ -550,8 +550,15 @@ const char* ShimGetenv(const char* name) {
   if (strcmp(name, "LANG") == 0 || strcmp(name, "LC_ALL") == 0)
     return "en_US.UTF-8";
   const char* v = getenv(name);
-  if (getenv("ARC_TRACE_ENV") && strncmp(name, "UNITY_", 6) == 0)
-    fprintf(stderr, "[env] %s -> %s\n", name, v ? v : "(null)");
+  // This is a hot import: asking the CRT for the trace flag on every lookup
+  // doubled the cost of every guest getenv. Read both flags once.
+  static const bool trace = getenv("ARC_TRACE_ENV") != nullptr;
+  static const bool trace_all = getenv("ARC_TRACE_ENV_ALL") != nullptr;
+  if (trace_all || (trace && strncmp(name, "UNITY_", 6) == 0)) {
+    static int shown;
+    if (!trace_all || shown++ < 5000)
+      fprintf(stderr, "[env] %s -> %s\n", name, v ? v : "(null)");
+  }
   return v;
 }
 
@@ -846,7 +853,7 @@ struct GuestProbe {
   uint32_t generation;
 };
 
-thread_local GuestProbe g_probes[4];
+thread_local GuestProbe g_probes[8];
 thread_local unsigned g_probe_next;
 
 std::atomic<uint32_t> g_memory_generation{1};
@@ -877,7 +884,7 @@ bool GuestRangeReadable(uint64_t address, size_t size) {
   const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
   const uintptr_t limit = base + mbi.RegionSize;
   if (end > limit) return false;
-  g_probes[g_probe_next++ & 3] = GuestProbe{base, limit, generation};
+  g_probes[g_probe_next++ & 7] = GuestProbe{base, limit, generation};
   return true;
 #else
   return address != 0 && size != 0;
